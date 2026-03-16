@@ -7,6 +7,7 @@ import {
   ListToolsRequestSchema,
   type CallToolRequest
 } from '@modelcontextprotocol/sdk/types.js';
+import { analyzeDependencies } from './dependency/analyzer.js';
 
 const SERVER_NAME = 'internal-dev-agent';
 const SERVER_VERSION = '0.0.1';
@@ -160,31 +161,28 @@ async function handleRepoArchitecture(args: ToolArgs) {
 async function handleAnalyzeDependencies(args: ToolArgs) {
   const srcDir = asString(args.srcDir) || 'src';
   const srcPath = safeJoinWorkspace(srcDir);
-  const files = await listSourceFiles(srcPath);
-
-  const graph = new Map<string, string[]>();
-
-  for (const absFile of files) {
-    const fileText = await fs.readFile(absFile, 'utf-8');
-    const imports = parseImports(fileText)
-      .filter((i) => i.startsWith('.'))
-      .map((rel) => resolveImportTarget(absFile, rel))
-      .filter(Boolean) as string[];
-
-    graph.set(absFile, imports);
-  }
-
-  const cycles = findCycles(graph);
+  const analyzed = await analyzeDependencies(workspaceRoot, srcPath);
 
   const summary = [
     `Workspace: ${workspaceRoot}`,
     `Source dir: ${srcDir}`,
-    `Nodes: ${graph.size}`,
-    `Edges: ${countEdges(graph)}`,
-    `Cycles: ${cycles.length}`
+    `Nodes: ${analyzed.nodes}`,
+    `Edges: ${analyzed.edges}`,
+    `Cycles: ${analyzed.cycles.length}`
   ];
 
-  const cycleLines = cycles.slice(0, 10).map((cycle, idx) => `${idx + 1}. ${cycle.join(' -> ')}`);
+  if (analyzed.languageBreakdown.length > 0) {
+    summary.push('Language breakdown:');
+    for (const item of analyzed.languageBreakdown) {
+      summary.push(`- ${item.language}: nodes=${item.nodes}, edges=${item.edges}`);
+    }
+  }
+
+  if (analyzed.frameworkHints.length > 0) {
+    summary.push(`Framework hints: ${analyzed.frameworkHints.join(', ')}`);
+  }
+
+  const cycleLines = analyzed.cycles.slice(0, 10).map((cycle, idx) => `${idx + 1}. ${cycle.join(' -> ')}`);
   if (cycleLines.length > 0) {
     summary.push('Cycle samples:');
     summary.push(...cycleLines);
@@ -341,96 +339,6 @@ function renderIndex(moduleName: string): string {
   ].join('\n');
 }
 
-function countEdges(graph: Map<string, string[]>): number {
-  let edgeCount = 0;
-  for (const edges of graph.values()) {
-    edgeCount += edges.length;
-  }
-  return edgeCount;
-}
-
-function findCycles(graph: Map<string, string[]>): string[][] {
-  const visited = new Set<string>();
-  const stack = new Set<string>();
-  const pathStack: string[] = [];
-  const cycles: string[][] = [];
-  const seenCycles = new Set<string>();
-
-  const dfs = (node: string) => {
-    visited.add(node);
-    stack.add(node);
-    pathStack.push(node);
-
-    for (const next of graph.get(node) ?? []) {
-      if (!graph.has(next)) {
-        continue;
-      }
-
-      if (!visited.has(next)) {
-        dfs(next);
-        continue;
-      }
-
-      if (stack.has(next)) {
-        const startIdx = pathStack.indexOf(next);
-        const cycle = pathStack.slice(startIdx).concat(next).map((p) => path.relative(workspaceRoot, p));
-        const key = cycle.join('>');
-        if (!seenCycles.has(key)) {
-          seenCycles.add(key);
-          cycles.push(cycle);
-        }
-      }
-    }
-
-    stack.delete(node);
-    pathStack.pop();
-  };
-
-  for (const node of graph.keys()) {
-    if (!visited.has(node)) {
-      dfs(node);
-    }
-  }
-
-  return cycles;
-}
-
-function parseImports(source: string): string[] {
-  const out: string[] = [];
-  const regex = /^\s*import\s+(?:[\w*{}\s,]+\s+from\s+)?['\"]([^'\"]+)['\"]/gm;
-  let m: RegExpExecArray | null;
-
-  while ((m = regex.exec(source)) !== null) {
-    out.push(m[1]);
-  }
-
-  return out;
-}
-
-function resolveImportTarget(fromFile: string, specifier: string): string | undefined {
-  const dir = path.dirname(fromFile);
-  const base = path.resolve(dir, specifier);
-  const candidates = [
-    base,
-    `${base}.ts`,
-    `${base}.tsx`,
-    `${base}.js`,
-    `${base}.jsx`,
-    path.join(base, 'index.ts'),
-    path.join(base, 'index.tsx'),
-    path.join(base, 'index.js'),
-    path.join(base, 'index.jsx')
-  ];
-
-  for (const p of candidates) {
-    if (fileExistsSyncStyle(p)) {
-      return p;
-    }
-  }
-
-  return undefined;
-}
-
 function fileExistsSyncStyle(filePath: string): boolean {
   try {
     const stat = statSync(filePath);
@@ -452,7 +360,7 @@ async function pathExists(targetPath: string): Promise<boolean> {
 async function listSourceFiles(root: string): Promise<string[]> {
   const out: string[] = [];
   await walk(root, out);
-  return out.filter((f) => /\.(ts|tsx|js|jsx)$/.test(f));
+  return out.filter((f) => /\.(ts|tsx|js|jsx|py)$/.test(f));
 }
 
 async function walk(dir: string, out: string[]): Promise<void> {

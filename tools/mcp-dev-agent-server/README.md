@@ -28,7 +28,7 @@ Expose internal development tools through an MCP server for Copilot.
 ## Implemented Tools
 
 - repo_architecture
-- analyze_dependencies
+- analyze_dependencies (TypeScript/JavaScript/Python)
 - create_module
 - delete_module
 
@@ -73,6 +73,12 @@ Windows PowerShell command:
 
 ```powershell
 $env:TOOLKIT_REPO_URL="https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git"; iwr "https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1?v=20260316" -UseBasicParsing | iex
+```
+
+Install this tool explicitly with ToolId selector:
+
+```powershell
+$env:TOOLKIT_REPO_URL="https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git"; $env:TOOLKIT_TOOL_ID="mcp-dev-agent-server"; iwr "https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1?v=20260316" -UseBasicParsing | iex
 ```
 
 After running, verify output includes: `public-install.ps1 version: 2026-03-16.3`

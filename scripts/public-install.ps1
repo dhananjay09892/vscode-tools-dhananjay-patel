@@ -1,6 +1,7 @@
 param(
   [string]$ToolkitRepoUrl = $env:TOOLKIT_REPO_URL,
   [string]$TargetRepoPath = (Get-Location).Path,
+  [string]$ToolId = $env:TOOLKIT_TOOL_ID,
   [string]$ServerName = 'internal-dev-agent',
   [string]$Branch = 'main',
   [switch]$KeepTemp
@@ -22,12 +23,33 @@ if ([string]::IsNullOrWhiteSpace($ToolkitRepoUrl)) {
   throw 'Toolkit repo URL is required. Set TOOLKIT_REPO_URL env var or pass -ToolkitRepoUrl.'
 }
 
+if ([string]::IsNullOrWhiteSpace($ToolId)) {
+  $ToolId = 'mcp-dev-agent-server'
+}
+
+$supportedTools = @{
+  'mcp-dev-agent-server' = @{
+    SourceSubPath = 'tools/mcp-dev-agent-server'
+    InstallSubPath = '.copilot-tools/mcp-dev-agent-server'
+    Kind = 'mcp-server'
+  }
+}
+
+if (-not $supportedTools.ContainsKey($ToolId)) {
+  $allowed = ($supportedTools.Keys | Sort-Object) -join ', '
+  throw "Unknown ToolId '$ToolId'. Supported values: $allowed"
+}
+
 Assert-CommandExists -Name 'git'
 Assert-CommandExists -Name 'npm'
 
 $targetFullPath = (Resolve-Path -Path $TargetRepoPath).Path
 $tempRoot = Join-Path $env:TEMP ("copilot-tools-" + [Guid]::NewGuid().ToString('N'))
-$installedServerDir = Join-Path $targetFullPath '.copilot-tools/mcp-dev-agent-server'
+$toolSpec = $supportedTools[$ToolId]
+$sourceToolSubPath = $toolSpec.SourceSubPath
+$installToolSubPath = $toolSpec.InstallSubPath
+$toolKind = $toolSpec.Kind
+$installedToolDir = Join-Path $targetFullPath $installToolSubPath
 
 Write-Host "Preparing toolkit source at temp path: $tempRoot"
 
@@ -44,27 +66,29 @@ if (Test-Path $ToolkitRepoUrl) {
   }
 }
 
-$serverDir = Join-Path $tempRoot 'tools/mcp-dev-agent-server'
-if (-not (Test-Path $serverDir)) {
-  throw "Server folder not found: $serverDir"
+$toolDir = Join-Path $tempRoot $sourceToolSubPath
+if (-not (Test-Path $toolDir)) {
+  throw "Tool folder not found for '$ToolId': $toolDir"
 }
 
-Write-Host "Deploying MCP server to target repo: $installedServerDir"
-if (Test-Path $installedServerDir) {
-  Remove-Item $installedServerDir -Recurse -Force
+Write-Host "Deploying tool '$ToolId' to target repo: $installedToolDir"
+if (Test-Path $installedToolDir) {
+  Remove-Item $installedToolDir -Recurse -Force
 }
-New-Item -ItemType Directory -Path $installedServerDir -Force | Out-Null
-Copy-Item -Path (Join-Path $serverDir '*') -Destination $installedServerDir -Recurse -Force
+New-Item -ItemType Directory -Path $installedToolDir -Force | Out-Null
+Copy-Item -Path (Join-Path $toolDir '*') -Destination $installedToolDir -Recurse -Force
 
-Write-Host 'Installing server dependencies in target repo...'
-npm --prefix $installedServerDir ci
+Write-Host "Installing '$ToolId' dependencies in target repo..."
+npm --prefix $installedToolDir ci
 
-Write-Host 'Building MCP server in target repo...'
-npm --prefix $installedServerDir run build
+Write-Host "Building '$ToolId' in target repo..."
+npm --prefix $installedToolDir run build
 
-Write-Host "Installing MCP config into target repo: $targetFullPath"
-$serverDistPath = Join-Path $installedServerDir 'dist/index.js'
-npm --prefix $installedServerDir run install:repo -- --target $targetFullPath --name $ServerName --server-dist $serverDistPath
+if ($toolKind -eq 'mcp-server') {
+  Write-Host "Installing MCP config into target repo: $targetFullPath"
+  $serverDistPath = Join-Path $installedToolDir 'dist/index.js'
+  npm --prefix $installedToolDir run install:repo -- --target $targetFullPath --name $ServerName --server-dist $serverDistPath
+}
 
 $mcpConfigPath = Join-Path $targetFullPath '.vscode/mcp.json'
 if (-not (Test-Path $mcpConfigPath)) {
