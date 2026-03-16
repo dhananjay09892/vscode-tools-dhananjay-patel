@@ -1,0 +1,33 @@
+{
+  "layers": {
+    "controller": [
+      "src/controllers/",
+      "src/controller/"
+    ],
+    "service": [
+      "src/services/",
+      "src/service/"
+    ],
+    "repository": [
+      "src/repositories/",
+      "src/repository/"
+    ]
+  },
+  "allowedImports": {
+    "controller": [
+      "service"
+    ],
+    "service": [
+      "repository"
+    ],
+    "repository": []
+  },
+  "includeGlobs": [
+    "**/*.{ts,tsx,js,jsx}"
+  ],
+  "excludeGlobs": [
+    "**/node_modules/**",
+    "**/dist/**",
+    "**/out/**"
+  ]
+}

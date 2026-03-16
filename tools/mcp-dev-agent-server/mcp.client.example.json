@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "internal-dev-agent": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "tools/mcp-dev-agent-server/dist/index.js"
+      ],
+      "env": {
+        "WORKSPACE_ROOT": "${workspaceFolder}"
+      }
+    }
+  }
+}

@@ -1,0 +1,61 @@
+name: Tools CI
+
+on:
+  push:
+    paths:
+      - 'tools/**'
+      - '.github/workflows/tools-ci.yml'
+  pull_request:
+    paths:
+      - 'tools/**'
+      - '.github/workflows/tools-ci.yml'
+
+jobs:
+  architecture-validator:
+    name: Architecture Validator Build
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/architecture-validator
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: tools/architecture-validator/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Compile extension
+        run: npm run compile
+
+  mcp-dev-agent-server:
+    name: MCP Dev Agent Server Build And Smoke
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/mcp-dev-agent-server
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: tools/mcp-dev-agent-server/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build server
+        run: npm run build
+
+      - name: Smoke test MCP tools
+        run: npm run smoke
