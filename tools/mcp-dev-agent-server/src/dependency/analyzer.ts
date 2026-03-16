@@ -6,6 +6,14 @@ export interface AnalyzerResult {
   cycles: string[][];
   nodes: number;
   edges: number;
+  internalEdges: number;
+  externalImports: string[];
+  unresolvedImports: string[];
+  totalImportsSeen: number;
+  confidenceScore: number;
+  confidenceLabel: 'low' | 'medium' | 'high';
+  topCoupledFiles: Array<{ file: string; count: number }>;
+  topImportedFiles: Array<{ file: string; count: number }>;
   languageBreakdown: Array<{ language: string; nodes: number; edges: number }>;
   frameworkHints: string[];
 }
@@ -14,13 +22,26 @@ interface LanguageAdapter {
   language: string;
   extensions: string[];
   prepare?: (files: string[], srcPath: string) => unknown;
-  resolveImports: (absFile: string, source: string, context: AdapterContext) => string[];
+  resolveImports: (absFile: string, source: string, context: AdapterContext) => ResolvedImports;
 }
 
 interface AdapterContext {
   srcPath: string;
   files: string[];
   preparedData?: unknown;
+}
+
+interface ResolvedImports {
+  internal: string[];
+  external: string[];
+  unresolved: string[];
+  seenImportCount: number;
+}
+
+interface PythonPreparedData {
+  moduleIndex: Map<string, string>;
+  moduleByFile: Map<string, string>;
+  segmentHints: Set<string>;
 }
 
 type PythonImportEntry =
@@ -31,41 +52,92 @@ const JS_TS_ADAPTER: LanguageAdapter = {
   language: 'javascript-typescript',
   extensions: ['.ts', '.tsx', '.js', '.jsx'],
   resolveImports: (absFile, source) => {
-    return parseJsImports(source)
-      .filter((i) => i.startsWith('.'))
-      .map((rel) => resolveJsImportTarget(absFile, rel))
-      .filter(Boolean) as string[];
+    const internal = new Set<string>();
+    const external = new Set<string>();
+    const unresolved = new Set<string>();
+    const imports = parseJsImports(source);
+
+    for (const specifier of imports) {
+      if (specifier.startsWith('.')) {
+        const resolved = resolveJsImportTarget(absFile, specifier);
+        if (resolved) {
+          internal.add(resolved);
+        } else {
+          unresolved.add(specifier);
+        }
+        continue;
+      }
+
+      external.add(normalizePackageName(specifier));
+    }
+
+    return {
+      internal: sortStrings([...internal]),
+      external: sortStrings([...external]),
+      unresolved: sortStrings([...unresolved]),
+      seenImportCount: imports.length
+    };
   }
 };
 
 const PYTHON_ADAPTER: LanguageAdapter = {
   language: 'python',
   extensions: ['.py'],
-  prepare: (files, srcPath) => buildPythonModuleIndex(files, srcPath),
+  prepare: (files, srcPath) => buildPythonPreparedData(files, srcPath),
   resolveImports: (absFile, source, context) => {
-    const moduleIndex = context.preparedData as Map<string, string>;
-    if (!moduleIndex) {
-      return [];
+    const prepared = context.preparedData as PythonPreparedData;
+    if (!prepared) {
+      return {
+        internal: [],
+        external: [],
+        unresolved: [],
+        seenImportCount: 0
+      };
     }
 
-    const currentModule = pythonModuleNameFromFile(absFile, moduleIndex);
+    const currentModule = prepared.moduleByFile.get(absFile);
     if (!currentModule) {
-      return [];
+      return {
+        internal: [],
+        external: [],
+        unresolved: [],
+        seenImportCount: 0
+      };
     }
 
     const parsed = parsePythonImports(source);
-    const resolved = new Set<string>();
+    const internal = new Set<string>();
+    const external = new Set<string>();
+    const unresolved = new Set<string>();
 
     for (const entry of parsed) {
       for (const moduleName of resolvePythonModuleNames(entry, currentModule)) {
-        const filePath = moduleIndex.get(moduleName);
+        const filePath = resolvePythonInternalTarget(moduleName, prepared.moduleIndex);
         if (filePath) {
-          resolved.add(filePath);
+          internal.add(filePath);
+          continue;
+        }
+
+        if (entry.kind === 'from' && entry.level > 0) {
+          unresolved.add(moduleName || '(relative import)');
+          continue;
+        }
+
+        const first = moduleName.split('.')[0];
+        if (prepared.segmentHints.has(first)) {
+          unresolved.add(moduleName);
+        } else {
+          external.add(first);
         }
       }
     }
 
-    return [...resolved];
+    return {
+      internal: sortStrings([...internal]),
+      external: sortStrings([...external]),
+      unresolved: sortStrings([...unresolved]),
+      seenImportCount: parsed.length
+    };
   }
 };
 
@@ -74,6 +146,9 @@ const ADAPTERS: LanguageAdapter[] = [JS_TS_ADAPTER, PYTHON_ADAPTER];
 export async function analyzeDependencies(workspaceRoot: string, srcPath: string): Promise<AnalyzerResult> {
   const files = await listSourceFiles(srcPath, ADAPTERS);
   const graph = new Map<string, string[]>();
+  const externalImports = new Set<string>();
+  const unresolvedImports = new Set<string>();
+  let totalImportsSeen = 0;
 
   const contexts = new Map<LanguageAdapter, AdapterContext>();
   for (const adapter of ADAPTERS) {
@@ -93,19 +168,39 @@ export async function analyzeDependencies(workspaceRoot: string, srcPath: string
 
     const fileText = await fs.readFile(absFile, 'utf-8');
     const context = contexts.get(adapter) as AdapterContext;
-    const imports = adapter.resolveImports(absFile, fileText, context);
-    graph.set(absFile, imports);
+    const resolved = adapter.resolveImports(absFile, fileText, context);
+    totalImportsSeen += resolved.seenImportCount;
+    for (const item of resolved.external) {
+      externalImports.add(item);
+    }
+    for (const item of resolved.unresolved) {
+      unresolvedImports.add(item);
+    }
+
+    graph.set(absFile, sortStrings(resolved.internal));
   }
 
   const cycles = findCycles(graph, workspaceRoot);
   const languageBreakdown = buildLanguageBreakdown(graph);
   const frameworkHints = await detectFrameworkHints(workspaceRoot, files);
+  const topCoupledFiles = buildTopCoupledFiles(graph, workspaceRoot, 10);
+  const topImportedFiles = buildTopImportedFiles(graph, workspaceRoot, 10);
+  const internalEdges = countEdges(graph);
+  const confidence = computeConfidence(internalEdges, totalImportsSeen, unresolvedImports.size);
 
   return {
     graph,
     cycles,
     nodes: graph.size,
-    edges: countEdges(graph),
+    edges: internalEdges,
+    internalEdges,
+    externalImports: sortStrings([...externalImports]),
+    unresolvedImports: sortStrings([...unresolvedImports]),
+    totalImportsSeen,
+    confidenceScore: confidence.score,
+    confidenceLabel: confidence.label,
+    topCoupledFiles,
+    topImportedFiles,
     languageBreakdown,
     frameworkHints
   };
@@ -203,8 +298,10 @@ function resolveJsImportTarget(fromFile: string, specifier: string): string | un
   return undefined;
 }
 
-function buildPythonModuleIndex(pyFiles: string[], srcPath: string): Map<string, string> {
-  const out = new Map<string, string>();
+function buildPythonPreparedData(pyFiles: string[], srcPath: string): PythonPreparedData {
+  const moduleIndex = new Map<string, string>();
+  const moduleByFile = new Map<string, string>();
+  const segmentHints = new Set<string>();
 
   for (const absFile of pyFiles) {
     const rel = path.relative(srcPath, absFile).replace(/\\/g, '/');
@@ -219,15 +316,26 @@ function buildPythonModuleIndex(pyFiles: string[], srcPath: string): Map<string,
       continue;
     }
 
-    out.set(normalizedParts.join('.'), absFile);
+    const moduleName = normalizedParts.join('.');
+    moduleIndex.set(moduleName, absFile);
+    moduleByFile.set(absFile, moduleName);
+
+    for (const segment of normalizedParts) {
+      segmentHints.add(segment);
+    }
   }
 
-  return out;
+  return {
+    moduleIndex,
+    moduleByFile,
+    segmentHints
+  };
 }
 
 function parsePythonImports(source: string): PythonImportEntry[] {
+  const normalized = normalizePythonImportSource(source);
   const entries: PythonImportEntry[] = [];
-  const lines = source.split('\n');
+  const lines = normalized.split('\n');
 
   for (const rawLine of lines) {
     const line = rawLine.trim();
@@ -253,7 +361,7 @@ function parsePythonImports(source: string): PythonImportEntry[] {
       const module = fromMatch[2];
       const names = fromMatch[3]
         .split(',')
-        .map((item) => item.trim().split(/\s+as\s+/)[0].trim())
+        .map((item) => item.replace(/[()]/g, '').trim().split(/\s+as\s+/)[0].trim())
         .filter(Boolean)
         .filter((name) => name !== '*');
 
@@ -267,6 +375,27 @@ function parsePythonImports(source: string): PythonImportEntry[] {
   }
 
   return entries;
+}
+
+function normalizePythonImportSource(source: string): string {
+  let normalized = source.replace(/\r\n/g, '\n');
+  normalized = normalized.replace(/\\\n/g, ' ');
+
+  normalized = normalized.replace(
+    /from\s+([\.\w]+)\s+import\s*\(([\s\S]*?)\)/g,
+    (_full, moduleName: string, importBody: string) => {
+      const compactNames = importBody
+        .replace(/\n/g, ' ')
+        .split(',')
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .join(', ');
+
+      return `from ${moduleName} import ${compactNames}`;
+    }
+  );
+
+  return normalized;
 }
 
 function resolvePythonModuleNames(entry: PythonImportEntry, currentModule: string): string[] {
@@ -302,11 +431,26 @@ function resolvePythonModuleNames(entry: PythonImportEntry, currentModule: strin
   return [...candidates];
 }
 
-function pythonModuleNameFromFile(absFile: string, moduleIndex: Map<string, string>): string | undefined {
-  for (const [moduleName, filePath] of moduleIndex.entries()) {
-    if (filePath === absFile) {
-      return moduleName;
+function resolvePythonInternalTarget(moduleName: string, moduleIndex: Map<string, string>): string | undefined {
+  const exact = moduleIndex.get(moduleName);
+  if (exact) {
+    return exact;
+  }
+
+  const suffixMatches: Array<{ module: string; file: string }> = [];
+  for (const [indexedModule, filePath] of moduleIndex.entries()) {
+    if (indexedModule.endsWith(`.${moduleName}`)) {
+      suffixMatches.push({ module: indexedModule, file: filePath });
     }
+  }
+
+  if (suffixMatches.length === 1) {
+    return suffixMatches[0].file;
+  }
+
+  if (suffixMatches.length > 1) {
+    suffixMatches.sort((a, b) => a.module.length - b.module.length || a.module.localeCompare(b.module));
+    return suffixMatches[0].file;
   }
 
   return undefined;
@@ -357,13 +501,72 @@ function findCycles(graph: Map<string, string[]>, workspaceRoot: string): string
     pathStack.pop();
   };
 
-  for (const node of graph.keys()) {
+  for (const node of sortStrings([...graph.keys()])) {
     if (!visited.has(node)) {
       dfs(node);
     }
   }
 
-  return cycles;
+  return cycles.sort((a, b) => a.join('>').localeCompare(b.join('>')));
+}
+
+function buildTopCoupledFiles(graph: Map<string, string[]>, workspaceRoot: string, limit: number): Array<{ file: string; count: number }> {
+  return sortTopEntries(
+    [...graph.entries()].map(([file, imports]) => ({ file: path.relative(workspaceRoot, file), count: imports.length })),
+    limit
+  );
+}
+
+function buildTopImportedFiles(graph: Map<string, string[]>, workspaceRoot: string, limit: number): Array<{ file: string; count: number }> {
+  const inbound = new Map<string, number>();
+
+  for (const imports of graph.values()) {
+    for (const target of imports) {
+      inbound.set(target, (inbound.get(target) ?? 0) + 1);
+    }
+  }
+
+  return sortTopEntries(
+    [...inbound.entries()].map(([file, count]) => ({ file: path.relative(workspaceRoot, file), count })),
+    limit
+  );
+}
+
+function sortTopEntries(entries: Array<{ file: string; count: number }>, limit: number): Array<{ file: string; count: number }> {
+  return entries
+    .sort((a, b) => b.count - a.count || a.file.localeCompare(b.file))
+    .slice(0, limit);
+}
+
+function computeConfidence(
+  internalEdges: number,
+  totalImportsSeen: number,
+  unresolvedCount: number
+): { score: number; label: 'low' | 'medium' | 'high' } {
+  if (totalImportsSeen <= 0) {
+    return { score: 0, label: 'low' };
+  }
+
+  const resolvedRatio = internalEdges / totalImportsSeen;
+  const unresolvedPenalty = unresolvedCount / totalImportsSeen;
+  const raw = Math.max(0, Math.min(1, resolvedRatio - unresolvedPenalty * 0.5));
+  const score = Number(raw.toFixed(3));
+
+  const label: 'low' | 'medium' | 'high' = score >= 0.6 ? 'high' : score >= 0.3 ? 'medium' : 'low';
+  return { score, label };
+}
+
+function normalizePackageName(specifier: string): string {
+  if (specifier.startsWith('@')) {
+    const parts = specifier.split('/').filter(Boolean);
+    return parts.slice(0, 2).join('/');
+  }
+
+  return specifier.split('/')[0];
+}
+
+function sortStrings(values: string[]): string[] {
+  return values.sort((a, b) => a.localeCompare(b));
 }
 
 function fileExistsSyncStyle(filePath: string): boolean {
@@ -379,11 +582,11 @@ async function listSourceFiles(root: string, adapters: LanguageAdapter[]): Promi
   const out: string[] = [];
   const allowed = new Set(adapters.flatMap((a) => a.extensions));
   await walk(root, out);
-  return out.filter((f) => allowed.has(path.extname(f).toLowerCase()));
+  return out.filter((f) => allowed.has(path.extname(f).toLowerCase())).sort((a, b) => a.localeCompare(b));
 }
 
 async function walk(dir: string, out: string[]): Promise<void> {
-  const entries = await readDirIfExists(dir);
+  const entries = (await readDirIfExists(dir)).sort((a, b) => a.name.localeCompare(b.name));
 
   for (const entry of entries) {
     if (entry.name === 'node_modules' || entry.name === 'dist' || entry.name === 'out' || entry.name.startsWith('.')) {

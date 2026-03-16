@@ -168,7 +168,12 @@ async function handleAnalyzeDependencies(args: ToolArgs) {
     `Source dir: ${srcDir}`,
     `Nodes: ${analyzed.nodes}`,
     `Edges: ${analyzed.edges}`,
-    `Cycles: ${analyzed.cycles.length}`
+    `Cycles: ${analyzed.cycles.length}`,
+    `Internal edges: ${analyzed.internalEdges}`,
+    `External imports: ${analyzed.externalImports.length}`,
+    `Unresolved imports: ${analyzed.unresolvedImports.length}`,
+    `Total imports seen: ${analyzed.totalImportsSeen}`,
+    `Confidence: ${analyzed.confidenceLabel} (${analyzed.confidenceScore})`
   ];
 
   if (analyzed.languageBreakdown.length > 0) {
@@ -182,11 +187,57 @@ async function handleAnalyzeDependencies(args: ToolArgs) {
     summary.push(`Framework hints: ${analyzed.frameworkHints.join(', ')}`);
   }
 
+  if (analyzed.topCoupledFiles.length > 0) {
+    summary.push('Top coupled files (outbound):');
+    for (const item of analyzed.topCoupledFiles) {
+      summary.push(`- ${item.file}: ${item.count}`);
+    }
+  }
+
+  if (analyzed.topImportedFiles.length > 0) {
+    summary.push('Top imported files (inbound):');
+    for (const item of analyzed.topImportedFiles) {
+      summary.push(`- ${item.file}: ${item.count}`);
+    }
+  }
+
+  if (analyzed.unresolvedImports.length > 0) {
+    summary.push('Unresolved import samples:');
+    for (const item of analyzed.unresolvedImports.slice(0, 10)) {
+      summary.push(`- ${item}`);
+    }
+  }
+
   const cycleLines = analyzed.cycles.slice(0, 10).map((cycle, idx) => `${idx + 1}. ${cycle.join(' -> ')}`);
   if (cycleLines.length > 0) {
     summary.push('Cycle samples:');
     summary.push(...cycleLines);
   }
+
+  summary.push('Summary JSON:');
+  summary.push(
+    JSON.stringify(
+      {
+        nodes: analyzed.nodes,
+        edges: analyzed.edges,
+        cycles: analyzed.cycles.length,
+        internalEdges: analyzed.internalEdges,
+        externalImports: analyzed.externalImports,
+        unresolvedImports: analyzed.unresolvedImports,
+        totalImportsSeen: analyzed.totalImportsSeen,
+        confidence: {
+          label: analyzed.confidenceLabel,
+          score: analyzed.confidenceScore
+        },
+        topCoupledFiles: analyzed.topCoupledFiles,
+        topImportedFiles: analyzed.topImportedFiles,
+        frameworkHints: analyzed.frameworkHints,
+        languageBreakdown: analyzed.languageBreakdown
+      },
+      null,
+      2
+    )
+  );
 
   return textResult(summary.join('\n'));
 }

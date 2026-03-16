@@ -32,6 +32,28 @@ Expose internal development tools through an MCP server for Copilot.
 - create_module
 - delete_module
 
+## analyze_dependencies Output
+
+The dependency analyzer now returns:
+
+- Node, edge, and cycle totals
+- Language breakdown
+- Internal edge count
+- External import package list
+- Unresolved import list
+- Confidence score (`low`/`medium`/`high`)
+- Top coupled files (outbound imports)
+- Top imported files (inbound imports)
+- Framework hints
+- A machine-readable summary JSON block
+
+## Accuracy Boundaries
+
+- TypeScript/JavaScript: best results for relative imports and standard `index` resolution.
+- Python: supports `import`, `from ... import ...`, relative imports, and common multi-line import forms.
+- Python absolute imports are matched using exact and suffix-based module resolution to better handle layouts like `src/app/...` imported as `app.*`.
+- Some unresolved imports may still require alias/root configuration for monorepos and custom package roots.
+
 ## Quick Start
 
 1. Install dependencies:
