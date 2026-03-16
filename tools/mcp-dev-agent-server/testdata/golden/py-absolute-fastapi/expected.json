@@ -1,0 +1,20 @@
+{
+  "name": "py-absolute-fastapi",
+  "srcDir": "src",
+  "expect": {
+    "nodes": 5,
+    "edges": 5,
+    "cycles": 0,
+    "confidenceLabel": "medium",
+    "externalImportsIncludes": ["fastapi"],
+    "unresolvedImportsIncludes": ["app.missing", "app.utils.helper"],
+    "frameworkHintsIncludes": ["fastapi"],
+    "languageBreakdownIncludes": [
+      {
+        "language": "python",
+        "nodes": 5,
+        "edges": 5
+      }
+    ]
+  }
+}

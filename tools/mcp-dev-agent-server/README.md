@@ -54,6 +54,19 @@ The dependency analyzer now returns:
 - Python absolute imports are matched using exact and suffix-based module resolution to better handle layouts like `src/app/...` imported as `app.*`.
 - Some unresolved imports may still require alias/root configuration for monorepos and custom package roots.
 
+## Analyzer Regression Suite
+
+Run golden-corpus regression tests for dependency analysis:
+
+	npm run test:golden
+
+Fixture corpus location:
+
+- testdata/golden/js-cycle-unresolved
+- testdata/golden/py-absolute-fastapi
+
+Each fixture includes `expected.json` with stable expectations for nodes, edges, cycles, confidence label, unresolved imports, and language breakdown.
+
 ## Quick Start
 
 1. Install dependencies:
