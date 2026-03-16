@@ -70,11 +70,15 @@ Prerequisites:
 
 ### One command from website or README (Windows PowerShell)
 
-Replace YOUR_ORG and YOUR_REPO, then run in the target project folder:
+Run in the target project folder:
 
 ```powershell
-$env:TOOLKIT_REPO_URL="https://github.com/YOUR_ORG/YOUR_REPO.git"; iwr "https://raw.githubusercontent.com/YOUR_ORG/YOUR_REPO/main/scripts/public-install.ps1" -UseBasicParsing | iex
+$env:TOOLKIT_REPO_URL="https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git"; iwr "https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1" -UseBasicParsing | iex
 ```
+
+Repo:
+
+- https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git
 
 What this does:
 
