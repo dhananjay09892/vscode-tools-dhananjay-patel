@@ -7,6 +7,9 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+$InstallerVersion = '2026-03-16.3'
+
+Write-Host "public-install.ps1 version: $InstallerVersion"
 
 function Assert-CommandExists {
   param([string]$Name)
@@ -62,6 +65,27 @@ npm --prefix $installedServerDir run build
 Write-Host "Installing MCP config into target repo: $targetFullPath"
 $serverDistPath = Join-Path $installedServerDir 'dist/index.js'
 npm --prefix $installedServerDir run install:repo -- --target $targetFullPath --name $ServerName --server-dist $serverDistPath
+
+$mcpConfigPath = Join-Path $targetFullPath '.vscode/mcp.json'
+if (-not (Test-Path $mcpConfigPath)) {
+  throw "Expected MCP config was not created: $mcpConfigPath"
+}
+
+$mcpConfig = Get-Content $mcpConfigPath -Raw | ConvertFrom-Json
+$resolvedArg = $mcpConfig.servers.$ServerName.args[0]
+if ([string]::IsNullOrWhiteSpace($resolvedArg)) {
+  throw "MCP config is missing args[0] for server '$ServerName'"
+}
+
+if ($resolvedArg -match 'AppData/Local/Temp|AppData\\Local\\Temp|copilot-tools-[a-f0-9]{32}') {
+  throw "Unsafe temp path detected in mcp.json: $resolvedArg"
+}
+
+if (-not (Test-Path $resolvedArg)) {
+  throw "Configured MCP server file does not exist: $resolvedArg"
+}
+
+Write-Host "MCP server path validated: $resolvedArg"
 
 if (-not $KeepTemp) {
   Remove-Item $tempRoot -Recurse -Force

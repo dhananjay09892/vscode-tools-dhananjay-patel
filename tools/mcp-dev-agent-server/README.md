@@ -72,8 +72,10 @@ If your toolkit repo is public, developers can run one command in any target pro
 Windows PowerShell command:
 
 ```powershell
-$env:TOOLKIT_REPO_URL="https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git"; iwr "https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1" -UseBasicParsing | iex
+$env:TOOLKIT_REPO_URL="https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git"; iwr "https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1?v=20260316" -UseBasicParsing | iex
 ```
+
+After running, verify output includes: `public-install.ps1 version: 2026-03-16.3`
 
 Repo:
 
