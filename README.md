@@ -2,6 +2,14 @@
 
 This workspace organizes each internal tool idea into a separate folder so your team can build and maintain them independently.
 
+## Our Philosophy
+
+We are here to help software developers.
+
+We will continue creating new tools based on real needs from the software developer community.
+
+We truly love and respect the software developer community, and this project is our small step to help developers work faster with less stress.
+
 ## Tool Folders
 
 - `tools/codebase-integration-tool`
