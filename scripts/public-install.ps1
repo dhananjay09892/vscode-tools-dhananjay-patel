@@ -24,6 +24,7 @@ Assert-CommandExists -Name 'npm'
 
 $targetFullPath = (Resolve-Path -Path $TargetRepoPath).Path
 $tempRoot = Join-Path $env:TEMP ("copilot-tools-" + [Guid]::NewGuid().ToString('N'))
+$installedServerDir = Join-Path $targetFullPath '.copilot-tools/mcp-dev-agent-server'
 
 Write-Host "Preparing toolkit source at temp path: $tempRoot"
 
@@ -45,14 +46,22 @@ if (-not (Test-Path $serverDir)) {
   throw "Server folder not found: $serverDir"
 }
 
-Write-Host 'Installing server dependencies...'
-npm --prefix $serverDir ci
+Write-Host "Deploying MCP server to target repo: $installedServerDir"
+if (Test-Path $installedServerDir) {
+  Remove-Item $installedServerDir -Recurse -Force
+}
+New-Item -ItemType Directory -Path $installedServerDir -Force | Out-Null
+Copy-Item -Path (Join-Path $serverDir '*') -Destination $installedServerDir -Recurse -Force
 
-Write-Host 'Building MCP server...'
-npm --prefix $serverDir run build
+Write-Host 'Installing server dependencies in target repo...'
+npm --prefix $installedServerDir ci
+
+Write-Host 'Building MCP server in target repo...'
+npm --prefix $installedServerDir run build
 
 Write-Host "Installing MCP config into target repo: $targetFullPath"
-npm --prefix $serverDir run install:repo -- --target $targetFullPath --name $ServerName
+$serverDistPath = Join-Path $installedServerDir 'dist/index.js'
+npm --prefix $installedServerDir run install:repo -- --target $targetFullPath --name $ServerName --server-dist $serverDistPath
 
 if (-not $KeepTemp) {
   Remove-Item $tempRoot -Recurse -Force

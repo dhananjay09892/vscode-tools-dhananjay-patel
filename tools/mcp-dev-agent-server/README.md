@@ -85,6 +85,14 @@ This command runs:
 
 It clones this toolkit, builds the MCP server, and installs target-repo .vscode/mcp.json.
 
+Installer behavior:
+
+- Deploys server runtime to target-repo/.copilot-tools/mcp-dev-agent-server
+- Builds that local runtime
+- Writes mcp.json with a stable path to target-repo/.copilot-tools/.../dist/index.js
+
+This prevents MODULE_NOT_FOUND errors caused by temporary folder cleanup.
+
 ## Environment
 
 - Optional: set WORKSPACE_ROOT to analyze a target repository.

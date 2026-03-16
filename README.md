@@ -83,9 +83,12 @@ Repo:
 What this does:
 
 1. Clones toolkit repo to a temp folder.
-2. Builds tools/mcp-dev-agent-server.
-3. Writes target project .vscode/mcp.json.
-4. Connects Copilot MCP tools to that project.
+2. Copies MCP server into target-repo/.copilot-tools/mcp-dev-agent-server.
+3. Builds server in that persistent folder.
+4. Writes target project .vscode/mcp.json.
+5. Connects Copilot MCP tools to that project.
+
+This avoids broken temp paths like AppData/Local/Temp/.../dist/index.js.
 
 Script location:
 

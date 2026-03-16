@@ -25,6 +25,9 @@ Thumbs.db
 .vscode/launch.json
 .vscode/tasks.json
 
+# Local installed MCP runtime
+.copilot-tools/
+
 # Local override configs
 *.local
 *.override
