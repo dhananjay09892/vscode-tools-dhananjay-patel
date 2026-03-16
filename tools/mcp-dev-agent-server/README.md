@@ -64,6 +64,7 @@ Fixture corpus location:
 
 - testdata/golden/js-cycle-unresolved
 - testdata/golden/py-absolute-fastapi
+- testdata/golden/py-multiline-aliases
 
 Each fixture includes `expected.json` with stable expectations for nodes, edges, cycles, confidence label, unresolved imports, and language breakdown.
 

@@ -1,0 +1,20 @@
+{
+  "name": "py-multiline-aliases",
+  "srcDir": "src",
+  "expect": {
+    "nodes": 4,
+    "edges": 3,
+    "cycles": 0,
+    "confidenceLabel": "high",
+    "externalImportsIncludes": ["fastapi"],
+    "unresolvedImportsIncludes": [],
+    "frameworkHintsIncludes": ["fastapi"],
+    "languageBreakdownIncludes": [
+      {
+        "language": "python",
+        "nodes": 4,
+        "edges": 3
+      }
+    ]
+  }
+}
