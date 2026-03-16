@@ -7,6 +7,7 @@ Expose internal development tools through an MCP server for Copilot.
 ## Example Commands
 
 - `/create-module user-auth`
+- `/create-module user-auth language=python framework=fastapi`
 - `/add-endpoint POST /login`
 - `/generate-tests user-service`
 - `/analyze-dependencies`
@@ -146,6 +147,9 @@ This prevents MODULE_NOT_FOUND errors caused by temporary folder cleanup.
 
 - create_module defaults to dry-run mode.
 - Pass apply=true to write files.
+- create_module supports `language=typescript` (default) and `language=python`.
+- Python mode uses FastAPI preset files: `routes.py`, `service.py`, `schema.py`, `test_<module>.py`, `__init__.py`.
+- Optional `registerRouter=true` appends router include lines (default router file: `src/app/routes.py`; override with `routerFile`).
 - delete_module defaults to dry-run mode.
 - Pass apply=true to remove module folder.
 - Path validation prevents writing outside workspace root.

@@ -111,8 +111,49 @@ async function run() {
   const deleteApplyText = deleteModuleApply?.content?.[0]?.text ?? '';
   assert(deleteApplyText.includes('Module deleted:'), 'delete_module apply did not delete module');
 
+  const pythonSmokeName = 'test-python-module-smoke';
+  const createPythonDryRun = await client.callTool({
+    name: 'create_module',
+    arguments: {
+      name: pythonSmokeName,
+      srcDir: smokeSrcDir,
+      language: 'python',
+      framework: 'fastapi',
+      apply: false
+    }
+  });
+
+  const pythonDryText = createPythonDryRun?.content?.[0]?.text ?? '';
+  assert(pythonDryText.includes('language=python'), 'create_module python dry run did not use python preset');
+
+  const createPythonApply = await client.callTool({
+    name: 'create_module',
+    arguments: {
+      name: pythonSmokeName,
+      srcDir: smokeSrcDir,
+      language: 'python',
+      framework: 'fastapi',
+      apply: true
+    }
+  });
+
+  const pythonApplyText = createPythonApply?.content?.[0]?.text ?? '';
+  assert(pythonApplyText.includes('Module created:'), 'create_module python apply did not create module');
+
+  const deletePythonApply = await client.callTool({
+    name: 'delete_module',
+    arguments: {
+      name: pythonSmokeName,
+      srcDir: smokeSrcDir,
+      apply: true
+    }
+  });
+
+  const deletePythonText = deletePythonApply?.content?.[0]?.text ?? '';
+  assert(deletePythonText.includes('Module deleted:'), 'delete_module apply did not delete python module');
+
   await transport.close();
-  console.log('MCP smoke test passed: initialize, tools/list, and 5 tool calls succeeded.');
+  console.log('MCP smoke test passed: initialize, tools/list, and TypeScript/Python module flows succeeded.');
 }
 
 run()
