@@ -1,0 +1,15 @@
+﻿{
+  "servers": {
+    "internal-dev-agent": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "tools/code-architecture-toolkit/dist/index.js"
+      ],
+      "env": {
+        "WORKSPACE_ROOT": "${workspaceFolder}"
+      }
+    }
+  }
+}
+

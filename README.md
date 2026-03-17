@@ -1,4 +1,4 @@
-# VS Code Internal Tools Workspace
+﻿# VS Code Internal Tools Workspace
 
 This workspace organizes each internal tool idea into a separate folder so your team can build and maintain them independently.
 
@@ -18,7 +18,9 @@ We truly love and respect the software developer community, and this project is 
 - `tools/code-quality-enforcer`
 - `tools/architecture-validator`
 - `tools/dependency-analyzer`
-- `tools/mcp-dev-agent-server`
+- `tools/code-architecture-toolkit`
+- `tools/tool-reception`
+- `tools/playwright-tool`
 
 ## Suggested Build Order
 
@@ -36,17 +38,72 @@ For developer-friendly adoption across multiple repos, use MCP as the first deli
 2. Give developers a one-command installer to connect their repo.
 3. Add a lightweight website/internal docs page with that command.
 
+### One-line commands
+
+Use these copy-ready commands.
+
+Install MCP server into a target repo (from this workspace):
+
+```powershell
+npm --prefix tools/code-architecture-toolkit run build; npm --prefix tools/code-architecture-toolkit run install:repo -- --target "C:/path/to/project"
+```
+
+Public GitHub onboarding (default tool):
+
+Default tool is `tool-reception`.
+
+```powershell
+$env:TOOLKIT_REPO_URL="https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git"; iwr "https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1?v=20260317" -UseBasicParsing | iex
+```
+
+## Single Tool commands
+
+Public GitHub onboarding (code-architecture-toolkit override):
+
+```powershell
+$env:TOOLKIT_REPO_URL="https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git"; $env:TOOLKIT_TOOL_ID="code-architecture-toolkit"; iwr "https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1?v=20260317" -UseBasicParsing | iex
+```
+
+Public GitHub onboarding (architecture-validator):
+
+```powershell
+$env:TOOLKIT_REPO_URL="https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git"; $env:TOOLKIT_TOOL_ID="architecture-validator"; iwr "https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1?v=20260317" -UseBasicParsing | iex
+```
+
+Public GitHub onboarding (playwright-tool):
+
+```powershell
+$env:TOOLKIT_REPO_URL="https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git"; $env:TOOLKIT_TOOL_ID="playwright-tool"; iwr "https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1?v=20260317" -UseBasicParsing | iex
+```
+
+
+### Multiple one-line commands for multiple tools
+
+Build MCP server and extension tool together from this workspace:
+
+```powershell
+npm --prefix tools/code-architecture-toolkit run build; npm --prefix tools/architecture-validator run compile
+```
+
+Run MCP smoke and golden tests in one line:
+
+```powershell
+npm --prefix tools/code-architecture-toolkit run smoke; npm --prefix tools/code-architecture-toolkit run test:golden
+```
+
+Tool registry is manifest-driven at `scripts/tool-registry.json`, so adding more tools does not require installer logic changes.
+
 ### One command (current)
 
 From this repo:
 
 1. Build server:
 
-	npm --prefix tools/mcp-dev-agent-server run build
+	npm --prefix tools/code-architecture-toolkit run build
 
 2. Install into a target repo:
 
-	npm --prefix tools/mcp-dev-agent-server run install:repo -- --target "C:/path/to/project"
+	npm --prefix tools/code-architecture-toolkit run install:repo -- --target "C:/path/to/project"
 
 This writes target-repo/.vscode/mcp.json and connects Copilot to your tools.
 
@@ -81,20 +138,25 @@ Prerequisites:
 Run in the target project folder:
 
 ```powershell
-$env:TOOLKIT_REPO_URL="https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git"; iwr "https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1?v=20260316" -UseBasicParsing | iex
+$env:TOOLKIT_REPO_URL="https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git"; iwr "https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1?v=20260317" -UseBasicParsing | iex
 ```
+
+This installs default ToolId `tool-reception`.
 
 Install a specific tool only:
 
 ```powershell
-$env:TOOLKIT_REPO_URL="https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git"; $env:TOOLKIT_TOOL_ID="mcp-dev-agent-server"; iwr "https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1?v=20260316" -UseBasicParsing | iex
+$env:TOOLKIT_REPO_URL="https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git"; $env:TOOLKIT_TOOL_ID="code-architecture-toolkit"; iwr "https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1?v=20260317" -UseBasicParsing | iex
 ```
 
 Current supported ToolId values:
 
-- mcp-dev-agent-server
+- code-architecture-toolkit
+- architecture-validator
+- tool-reception
+- playwright-tool
 
-After running, verify output includes: `public-install.ps1 version: 2026-03-16.3`
+After running, verify output includes: `public-install.ps1 version: 2026-03-17.1`
 
 Repo:
 
@@ -103,7 +165,7 @@ Repo:
 What this does:
 
 1. Clones toolkit repo to a temp folder.
-2. Copies MCP server into target-repo/.copilot-tools/mcp-dev-agent-server.
+2. Copies selected tool runtime into target-repo/.copilot-tools/<tool-id>.
 3. Builds server in that persistent folder.
 4. Writes target project .vscode/mcp.json.
 5. Connects Copilot MCP tools to that project.
@@ -113,3 +175,4 @@ This avoids broken temp paths like AppData/Local/Temp/.../dist/index.js.
 Script location:
 
 - scripts/public-install.ps1
+

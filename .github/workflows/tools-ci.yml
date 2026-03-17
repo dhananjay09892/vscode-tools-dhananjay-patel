@@ -1,4 +1,4 @@
-name: Tools CI
+﻿name: Tools CI
 
 on:
   push:
@@ -34,12 +34,12 @@ jobs:
       - name: Compile extension
         run: npm run compile
 
-  mcp-dev-agent-server:
+  code-architecture-toolkit:
     name: MCP Dev Agent Server Build And Smoke
     runs-on: ubuntu-latest
     defaults:
       run:
-        working-directory: tools/mcp-dev-agent-server
+        working-directory: tools/code-architecture-toolkit
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -49,7 +49,7 @@ jobs:
         with:
           node-version: 20
           cache: npm
-          cache-dependency-path: tools/mcp-dev-agent-server/package-lock.json
+          cache-dependency-path: tools/code-architecture-toolkit/package-lock.json
 
       - name: Install dependencies
         run: npm ci

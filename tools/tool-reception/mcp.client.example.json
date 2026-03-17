@@ -1,0 +1,14 @@
+{
+  "servers": {
+    "tool-reception": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "tools/tool-reception/dist/index.js"
+      ],
+      "env": {
+        "WORKSPACE_ROOT": "${workspaceFolder}"
+      }
+    }
+  }
+}

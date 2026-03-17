@@ -1,0 +1,22 @@
+{
+  "name": "tool-reception",
+  "version": "0.0.1",
+  "private": true,
+  "description": "MCP reception tool that recommends the right internal tool for developer objectives",
+  "type": "module",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p ./",
+    "start": "node dist/index.js",
+    "dev": "npm run build && npm run start",
+    "smoke": "node scripts/smoke.mjs",
+    "install:repo": "node scripts/install-mcp-in-repo.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.16.5",
+    "typescript": "^5.6.2"
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "defaultToolId": "tool-reception",
+  "tools": {
+    "code-architecture-toolkit": {
+      "sourceSubPath": "tools/code-architecture-toolkit",
+      "installSubPath": ".copilot-tools/code-architecture-toolkit",
+      "kind": "mcp-server",
+      "installCommand": "ci",
+      "buildCommand": "build"
+    },
+    "architecture-validator": {
+      "sourceSubPath": "tools/architecture-validator",
+      "installSubPath": ".copilot-tools/architecture-validator",
+      "kind": "vscode-extension",
+      "installCommand": "install",
+      "buildCommand": "compile"
+    },
+    "tool-reception": {
+      "sourceSubPath": "tools/tool-reception",
+      "installSubPath": ".copilot-tools/tool-reception",
+      "kind": "mcp-server",
+      "installCommand": "install",
+      "buildCommand": "build"
+    },
+    "playwright-tool": {
+      "sourceSubPath": "tools/playwright-tool",
+      "installSubPath": ".copilot-tools/playwright-tool",
+      "kind": "mcp-server",
+      "installCommand": "install",
+      "buildCommand": "build"
+    }
+  }
+}
