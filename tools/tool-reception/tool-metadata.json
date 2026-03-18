@@ -1,0 +1,70 @@
+{
+  "architecture-validator": {
+    "summary": "VS Code extension that validates architecture boundaries and layer policies.",
+    "useCases": [
+      "layer policy checks",
+      "pre-merge architecture validation",
+      "import boundary rules"
+    ],
+    "keywords": [
+      "layer",
+      "validator",
+      "import policy",
+      "architecture rule"
+    ],
+    "documentation": "tools/architecture-validator/README.md"
+  },
+  "code-architecture-toolkit": {
+    "summary": "MCP server for dependency analysis, architecture views, and scaffolding.",
+    "useCases": [
+      "analyze imports",
+      "find cycles",
+      "scaffold module",
+      "repo architecture overview"
+    ],
+    "keywords": [
+      "dependency",
+      "cycle",
+      "module",
+      "architecture",
+      "fastapi",
+      "mcp"
+    ],
+    "documentation": "tools/code-architecture-toolkit/README.md"
+  },
+  "playwright-tool": {
+    "summary": "Playwright skill advisor for E2E, CI, flakiness reduction, and migration guidance.",
+    "useCases": [
+      "stabilize flaky tests",
+      "recommend Playwright guides",
+      "CI pipeline setup",
+      "Cypress to Playwright migration"
+    ],
+    "keywords": [
+      "playwright",
+      "e2e",
+      "flaky",
+      "trace",
+      "ci",
+      "test automation",
+      "cypress migration"
+    ],
+    "documentation": "tools/playwright-tool/README.md"
+  },
+  "tool-reception": {
+    "summary": "Tool discovery entry point that recommends the best internal tool for a task.",
+    "useCases": [
+      "discover available tools",
+      "route objective to best tool",
+      "tool onboarding guidance"
+    ],
+    "keywords": [
+      "discover",
+      "recommend",
+      "tooling",
+      "onboarding",
+      "catalog"
+    ],
+    "documentation": "tools/tool-reception/README.md"
+  }
+}

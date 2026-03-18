@@ -1,0 +1,24 @@
+{
+  "cases": [
+    {
+      "name": "Architecture validation",
+      "objective": "validate architecture layers before merge",
+      "expectedTopToolId": "architecture-validator"
+    },
+    {
+      "name": "Dependency analysis",
+      "objective": "find dependency cycles and coupling hotspots",
+      "expectedTopToolId": "code-architecture-toolkit"
+    },
+    {
+      "name": "Playwright flakiness",
+      "objective": "stabilize flaky Playwright tests in CI pipeline",
+      "expectedTopToolId": "playwright-tool"
+    },
+    {
+      "name": "Vague objective",
+      "objective": "help",
+      "expectNoStrongRecommendation": true
+    }
+  ]
+}

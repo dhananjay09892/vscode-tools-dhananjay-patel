@@ -43,6 +43,17 @@ async function run() {
 
   const catalogText = catalog?.content?.[0]?.text ?? '';
   assert(catalogText.includes('Tool Reception: available tool catalog'), 'catalog output missing expected header');
+  assert(!catalogText.includes('codebase-integration-tool'), 'catalog should not include placeholder tools');
+
+  const skippedNoTrigger = await client.callTool({
+    name: 'tool_reception',
+    arguments: {
+      objective: 'validate architecture layers before merge'
+    }
+  });
+
+  const skippedText = skippedNoTrigger?.content?.[0]?.text ?? '';
+  assert(skippedText.includes('skipped (objective provided without slash trigger)'), 'non-trigger objective should be skipped');
 
   const recommendation = await client.callTool({
     name: 'tool_reception',
@@ -54,6 +65,17 @@ async function run() {
 
   const recommendationText = recommendation?.content?.[0]?.text ?? '';
   assert(recommendationText.includes('Recommendations (top'), 'recommendation output missing expected section');
+  assert(recommendationText.includes('architecture-validator'), 'expected architecture-validator recommendation missing');
+
+  const lowConfidence = await client.callTool({
+    name: 'tool_reception',
+    arguments: {
+      userInput: '/tool-reception help'
+    }
+  });
+
+  const lowConfidenceText = lowConfidence?.content?.[0]?.text ?? '';
+  assert(lowConfidenceText.includes('No strong recommendation yet'), 'low confidence fallback should be returned for vague objectives');
 
   await transport.close();
   console.log('Tool Reception smoke test passed.');

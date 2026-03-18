@@ -4,10 +4,14 @@ on:
   push:
     paths:
       - 'tools/**'
+      - 'docs/**'
+      - 'scripts/tool-registry.json'
       - '.github/workflows/tools-ci.yml'
   pull_request:
     paths:
       - 'tools/**'
+      - 'docs/**'
+      - 'scripts/tool-registry.json'
       - '.github/workflows/tools-ci.yml'
 
 jobs:
@@ -59,3 +63,43 @@ jobs:
 
       - name: Smoke test MCP tools
         run: npm run smoke
+
+  tool-reception:
+    name: Tool Reception Docs And Quality Checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: tools/tool-reception
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: tools/tool-reception/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Validate docs index coverage
+        run: npm run check:docs-index
+
+      - name: Sync catalog artifacts from docs index
+        run: npm run sync:catalog
+
+      - name: Ensure synced artifacts are committed
+        working-directory: .
+        run: |
+          git diff --exit-code -- tools/tool-reception/tool-registry.snapshot.json tools/tool-reception/tool-metadata.json
+
+      - name: Build tool-reception
+        run: npm run build
+
+      - name: Run smoke test
+        run: npm run smoke
+
+      - name: Run golden tests
+        run: npm run test:golden

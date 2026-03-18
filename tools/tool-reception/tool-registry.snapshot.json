@@ -1,0 +1,17 @@
+{
+  "defaultToolId": "tool-reception",
+  "tools": {
+    "architecture-validator": {
+      "kind": "vscode-extension"
+    },
+    "code-architecture-toolkit": {
+      "kind": "mcp-server"
+    },
+    "playwright-tool": {
+      "kind": "mcp-server"
+    },
+    "tool-reception": {
+      "kind": "mcp-server"
+    }
+  }
+}
