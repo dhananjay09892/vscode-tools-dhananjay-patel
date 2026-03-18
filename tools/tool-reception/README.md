@@ -75,11 +75,16 @@ Run from this tool folder:
 - Optional input: `objective` (used only when `force=true` or for internal automation).
 - Optional input: `topK` (default 3, max 10).
 - Optional input: `force=true` for tests/automation to bypass slash check.
+- Optional input: `autoInstall=true` to request install handoff command for top recommendation.
+- Optional input: `confirmInstall="CONFIRM_INSTALL"` required with `autoInstall=true`.
+- Optional input: `installerRepoUrl` to override default public installer repository URL.
+- Optional input: `installerVersion` to override cache-bust version token for installer URL.
 
 Trigger rules:
 
 - Normal mode (`force=false`): recommendation objectives must come from `userInput` with `/tool-reception ...`.
 - Automation mode (`force=true`): direct `objective` is accepted.
+- Install handoff mode (`autoInstall=true`): no installation runs automatically; tool only returns a command after explicit confirmation token.
 
 Example payload:
 

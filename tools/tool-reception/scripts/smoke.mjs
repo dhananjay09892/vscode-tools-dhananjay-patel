@@ -77,6 +77,39 @@ async function run() {
   const lowConfidenceText = lowConfidence?.content?.[0]?.text ?? '';
   assert(lowConfidenceText.includes('No strong recommendation yet'), 'low confidence fallback should be returned for vague objectives');
 
+  const autoInstallBlocked = await client.callTool({
+    name: 'tool_reception',
+    arguments: {
+      userInput: '/tool-reception validate architecture layers before merge',
+      autoInstall: true
+    }
+  });
+
+  const autoInstallBlockedText = autoInstallBlocked?.content?.[0]?.text ?? '';
+  assert(
+    autoInstallBlockedText.includes('Install handoff: confirmation required'),
+    'autoInstall should require explicit confirmation token'
+  );
+
+  const autoInstallReady = await client.callTool({
+    name: 'tool_reception',
+    arguments: {
+      userInput: '/tool-reception validate architecture layers before merge',
+      autoInstall: true,
+      confirmInstall: 'CONFIRM_INSTALL'
+    }
+  });
+
+  const autoInstallReadyText = autoInstallReady?.content?.[0]?.text ?? '';
+  assert(
+    autoInstallReadyText.includes('Install handoff: ready'),
+    'autoInstall should provide command after explicit confirmation'
+  );
+  assert(
+    autoInstallReadyText.includes('$env:TOOLKIT_TOOL_ID="architecture-validator"'),
+    'autoInstall command should target the top recommendation tool'
+  );
+
   await transport.close();
   console.log('Tool Reception smoke test passed.');
 }

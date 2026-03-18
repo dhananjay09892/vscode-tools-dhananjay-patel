@@ -11,6 +11,9 @@ import {
 
 const SERVER_NAME = 'tool-reception';
 const SERVER_VERSION = '0.0.1';
+const INSTALL_CONFIRM_TOKEN = 'CONFIRM_INSTALL';
+const DEFAULT_INSTALLER_REPO_URL = 'https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git';
+const DEFAULT_INSTALLER_VERSION = '20260317';
 
 type ToolArgs = Record<string, unknown>;
 
@@ -112,6 +115,26 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'boolean',
               description:
                 'When true, bypass slash-trigger check and run directly. Useful for tests or internal automation.'
+            },
+            autoInstall: {
+              type: 'boolean',
+              description:
+                'When true, include an installation handoff plan for the top recommendation. No installation runs automatically.'
+            },
+            confirmInstall: {
+              type: 'string',
+              description:
+                `Explicit safety confirmation token required with autoInstall=true. Expected value: ${INSTALL_CONFIRM_TOKEN}`
+            },
+            installerRepoUrl: {
+              type: 'string',
+              description:
+                'Optional override for installer repo URL used in generated handoff command.'
+            },
+            installerVersion: {
+              type: 'string',
+              description:
+                'Optional cache-bust version token for public-install.ps1 URL. Default matches project README snippet.'
             }
           }
         }
@@ -172,6 +195,10 @@ async function handleToolReception(args: ToolArgs) {
 
   const objective = (objectiveFromInput || (force ? objectiveArg : '')).trim();
   const topK = Math.max(1, Math.min(10, asNumber(args.topK) ?? 3));
+  const autoInstall = asBoolean(args.autoInstall) ?? false;
+  const confirmInstall = (asString(args.confirmInstall) || '').trim();
+  const installerRepoUrl = (asString(args.installerRepoUrl) || DEFAULT_INSTALLER_REPO_URL).trim();
+  const installerVersion = (asString(args.installerVersion) || DEFAULT_INSTALLER_VERSION).trim();
 
   if (!objective) {
     const lines = [
@@ -220,11 +247,46 @@ async function handleToolReception(args: ToolArgs) {
     lines.push(`   One-line selector: ${rec.tool.onboarding}`);
   }
 
+  let installPlan: {
+    status: 'disabled' | 'needs-confirmation' | 'ready';
+    toolId?: string;
+    command?: string;
+    confirmationToken?: string;
+  } = { status: 'disabled' };
+
+  if (autoInstall) {
+    const topRecommendation = ranked[0]?.tool;
+    if (topRecommendation) {
+      const command = buildPublicInstallCommand(topRecommendation.toolId, installerRepoUrl, installerVersion);
+
+      if (confirmInstall !== INSTALL_CONFIRM_TOKEN) {
+        installPlan = {
+          status: 'needs-confirmation',
+          toolId: topRecommendation.toolId,
+          command,
+          confirmationToken: INSTALL_CONFIRM_TOKEN
+        };
+        lines.push('Install handoff: confirmation required before providing runnable install flow.');
+        lines.push(`Set confirmInstall to "${INSTALL_CONFIRM_TOKEN}" with autoInstall=true to enable the handoff command.`);
+      } else {
+        installPlan = {
+          status: 'ready',
+          toolId: topRecommendation.toolId,
+          command,
+          confirmationToken: INSTALL_CONFIRM_TOKEN
+        };
+        lines.push('Install handoff: ready. Run this PowerShell command in the target repository folder:');
+        lines.push(command);
+      }
+    }
+  }
+
   lines.push('Recommendation JSON:');
   lines.push(
     JSON.stringify(
       {
         objective,
+        installPlan,
         recommendations: ranked.map((rec) => ({
           toolId: rec.tool.toolId,
           score: rec.score,
@@ -519,6 +581,10 @@ function confidenceLabel(score: number): 'high' | 'medium' | 'low' {
     return 'medium';
   }
   return 'low';
+}
+
+function buildPublicInstallCommand(toolId: string, repoUrl: string, versionToken: string): string {
+  return `$env:TOOLKIT_REPO_URL="${repoUrl}"; $env:TOOLKIT_TOOL_ID="${toolId}"; $u="https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1?v=${versionToken}"; $s=Join-Path $env:TEMP "public-install.ps1"; iwr $u -UseBasicParsing -OutFile $s; & $s`;
 }
 
 async function main() {
