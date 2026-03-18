@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { promises as fs } from 'node:fs';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -9,8 +10,12 @@ import {
 
 const SERVER_NAME = 'playwright-tool';
 const SERVER_VERSION = '0.0.1';
+const DEFAULT_LLM_MODE: LlmMode = 'off';
+const DEFAULT_LLM_MODEL = 'gpt-4o-mini';
+const DEFAULT_ORG_DOCS_RELATIVE_PATH = '.playwright-tool/org-guides.json';
 
 type ToolArgs = Record<string, unknown>;
+type LlmMode = 'off' | 'external';
 
 type GuideCategory =
   | 'core'
@@ -27,6 +32,25 @@ interface GuideEntry {
   title: string;
   summary: string;
   keywords: string[];
+  source?: 'base' | 'org';
+}
+
+interface RankedGuide {
+  guide: GuideEntry;
+  score: number;
+  matches: string[];
+  reason?: string;
+}
+
+interface ExternalLlmConfig {
+  apiUrl: string;
+  apiKey: string;
+  model: string;
+}
+
+interface LlmRerankResult {
+  recommendations: RankedGuide[];
+  model: string;
 }
 
 const GOLDEN_RULES: string[] = [
@@ -40,7 +64,7 @@ const GOLDEN_RULES: string[] = [
   'Mock external dependencies, not your own application internals.'
 ];
 
-const GUIDE_CATALOG: GuideEntry[] = [
+const BASE_GUIDE_CATALOG: GuideEntry[] = [
   {
     id: 'locators',
     category: 'core',
@@ -539,6 +563,70 @@ const GUIDE_CATALOG: GuideEntry[] = [
   }
 ];
 
+const CATEGORY_KEYWORDS: Record<GuideCategory, string[]> = {
+  core: ['reliability', 'best practices', 'test design', 'stability'],
+  ci: ['pipeline reliability', 'build stability', 'artifacts', 'parallel execution'],
+  pom: ['maintainability', 'abstraction boundaries', 'readability'],
+  migration: ['legacy migration', 'framework transition', 'incremental adoption'],
+  'playwright-cli': ['automation scripting', 'interactive automation', 'developer tooling'],
+  architecture: ['test strategy', 'design decisions', 'scalability']
+};
+
+const GUIDE_DETAIL_OVERRIDES: Record<string, { summary: string; keywords: string[] }> = {
+  'assertions-and-waiting': {
+    summary:
+      'Detailed guidance for web-first assertions, auto-wait internals, and replacing brittle sleeps with deterministic synchronization patterns.',
+    keywords: ['race condition', 'explicit waits', 'auto retry', 'test determinism', 'ui synchronization']
+  },
+  authentication: {
+    summary:
+      'Practical authentication patterns including storageState bootstrapping, multi-role sessions, token lifecycle handling, and secure login setup for CI.',
+    keywords: ['storageState', 'multi-role', 'session reuse', 'token refresh', 'authenticated fixtures']
+  },
+  'network-mocking': {
+    summary:
+      'Comprehensive request interception strategies with conditional routing, fixture-driven API responses, HAR replay, and hybrid real-vs-mocked traffic policies.',
+    keywords: ['route.fulfill', 'route.continue', 'service virtualization', 'api stubbing', 'har replay']
+  },
+  'flaky-tests': {
+    summary:
+      'Root-cause playbook for flaky tests with diagnostics, retry policy design, trace-first debugging, and targeted stabilization patterns for CI.',
+    keywords: ['flakiness triage', 'retry strategy', 'trace analysis', 'stabilization', 'nondeterminism']
+  },
+  'ci-github-actions': {
+    summary:
+      'Production-ready GitHub Actions patterns for Playwright including caching, browser install strategy, matrix workflows, retries, and trace artifact retention.',
+    keywords: ['actions cache', 'workflow matrix', 'artifact upload', 'headless ci', 'ubuntu runners']
+  },
+  'parallel-and-sharding': {
+    summary:
+      'Optimization techniques for parallel workers and sharding with runtime balancing, suite partitioning, and fast-fail strategies for shorter CI feedback loops.',
+    keywords: ['worker tuning', 'shard balancing', 'test distribution', 'runtime optimization', 'ci throughput']
+  },
+  'page-object-model': {
+    summary:
+      'Maintainable Page Object Model structure, anti-pattern avoidance, and collaboration-friendly abstractions for long-lived Playwright test suites.',
+    keywords: ['domain abstractions', 'encapsulation', 'page components', 'test readability', 'refactoring support']
+  },
+  'from-cypress': {
+    summary:
+      'Migration blueprint from Cypress to Playwright covering architectural differences, fixture conversion, command replacement, and rollout strategy.',
+    keywords: ['cypress parity', 'command mapping', 'incremental migration', 'test runner differences', 'adoption plan']
+  },
+  'from-selenium': {
+    summary:
+      'Migration blueprint from Selenium/WebDriver with guidance on modern locator strategy, wait model changes, and cross-browser execution updates.',
+    keywords: ['webdriver migration', 'implicit vs explicit waits', 'selenium parity', 'cross-browser modernization']
+  },
+  'cli-test-generation': {
+    summary:
+      'Hands-on CLI code generation workflow with recorded interactions, cleanup conventions, and conversion into maintainable reusable tests.',
+    keywords: ['codegen cleanup', 'generated test hardening', 'automation bootstrap', 'cli record and replay']
+  }
+};
+
+const GUIDE_CATALOG: GuideEntry[] = enrichGuideCatalog(BASE_GUIDE_CATALOG);
+
 const workspaceRoot = path.resolve(process.env.WORKSPACE_ROOT ?? process.cwd());
 
 const server = new Server(
@@ -583,6 +671,21 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             force: {
               type: 'boolean',
               description: 'When true, bypass slash-trigger check and run directly.'
+            },
+            llmMode: {
+              type: 'string',
+              description:
+                'Guide selection strategy. "off" (default) uses keyword ranking. "external" uses keyword retrieval + external LLM reranking with fallback.'
+            },
+            orgDocsPath: {
+              type: 'string',
+              description:
+                'Optional path to organization guide JSON file. Relative paths resolve from WORKSPACE_ROOT. Overrides PLAYWRIGHT_TOOL_ORG_DOCS_PATH when provided.'
+            },
+            orgDocsFolder: {
+              type: 'string',
+              description:
+                'Optional folder containing organization markdown docs. Relative paths resolve from WORKSPACE_ROOT. Overrides PLAYWRIGHT_TOOL_ORG_DOCS_DIR when provided.'
             }
           }
         }
@@ -618,10 +721,41 @@ async function handlePlaywrightSkillAdvisor(args: ToolArgs) {
   const userInput = (asString(args.userInput) || '').trim();
   const force = asBoolean(args.force) ?? false;
   const includeRules = asBoolean(args.includeRules) ?? true;
+  const llmMode = parseLlmMode(asString(args.llmMode));
+  const orgDocsPathArg = (asString(args.orgDocsPath) || '').trim();
+  const orgDocsFolderArg = (asString(args.orgDocsFolder) || '').trim();
+  const orgDocsPath = orgDocsPathArg || process.env.PLAYWRIGHT_TOOL_ORG_DOCS_PATH || '';
+  const orgDocsFolder = orgDocsFolderArg || process.env.PLAYWRIGHT_TOOL_ORG_DOCS_DIR || '';
+  const catalogLoad = await getEffectiveCatalog(orgDocsPath, orgDocsFolder);
+  const effectiveCatalog = catalogLoad.catalog;
 
   const objectiveFromInput = parseTriggeredObjective(userInput);
   const objective = (asString(args.objective) || objectiveFromInput || '').trim();
   const topK = Math.max(1, Math.min(15, asNumber(args.topK) ?? 5));
+
+  if (isOrgDocsHelpIntent(objective)) {
+    return textResult(
+      [
+        'Yes. You can add an organization docs folder directly to Playwright Tool.',
+        'Options:',
+        '- Pass orgDocsFolder in tool arguments, for example: orgDocsFolder="docs/testing/playwright"',
+        '- Or set environment variable PLAYWRIGHT_TOOL_ORG_DOCS_DIR to a folder path.',
+        '- Folder mode auto-loads .md files recursively and converts them into recommendation entries.',
+        `- Default JSON path is still supported: ${DEFAULT_ORG_DOCS_RELATIVE_PATH}`,
+        '',
+        'Example call payload:',
+        JSON.stringify(
+          {
+            userInput: '/playwright-tool create automation flow for checkout and refunds',
+            orgDocsFolder: 'docs/testing/playwright',
+            topK: 5
+          },
+          null,
+          2
+        )
+      ].join('\n')
+    );
+  }
 
   if (!force && userInput && !objectiveFromInput) {
     return textResult(
@@ -634,11 +768,25 @@ async function handlePlaywrightSkillAdvisor(args: ToolArgs) {
   }
 
   if (!objective) {
-    const byCategory = groupByCategory(GUIDE_CATALOG);
+    const byCategory = groupByCategory(effectiveCatalog);
     const lines: string[] = [
       `Workspace: ${workspaceRoot}`,
       'Playwright catalog by category:'
     ];
+
+    lines.push(`Catalog size: ${effectiveCatalog.length} guides`);
+    if (catalogLoad.orgGuideCount > 0) {
+      lines.push(`Organization guides loaded: ${catalogLoad.orgGuideCount}`);
+      if (catalogLoad.orgDocsPath) {
+        lines.push(`Organization guide source: ${catalogLoad.orgDocsPath}`);
+      }
+      if (catalogLoad.orgDocsFolder) {
+        lines.push(`Organization docs folder: ${catalogLoad.orgDocsFolder}`);
+      }
+    }
+    if (catalogLoad.orgLoadWarning) {
+      lines.push(`Organization guide load warning: ${catalogLoad.orgLoadWarning}`);
+    }
 
     for (const category of Object.keys(byCategory).sort()) {
       const guides = byCategory[category as GuideCategory];
@@ -680,18 +828,64 @@ async function handlePlaywrightSkillAdvisor(args: ToolArgs) {
     return textResult(lines.join('\n'));
   }
 
-  const ranked = rankGuidesForObjective(objective).slice(0, topK);
+  const keywordRanked = rankGuidesForObjective(objective, effectiveCatalog);
+  let ranked = keywordRanked.slice(0, topK);
+  let rankingStrategy = 'keyword';
+  let llmModel: string | undefined;
+  let llmFallbackReason: string | undefined;
+
+  if (llmMode === 'external') {
+    const llmCandidateCount = Math.max(topK, Math.min(25, asNumber(args.llmTopN) ?? 12));
+    try {
+      const llmResult = await rerankWithExternalLlm(
+        objective,
+        keywordRanked.slice(0, llmCandidateCount),
+        topK
+      );
+      ranked = llmResult.recommendations;
+      llmModel = llmResult.model;
+      rankingStrategy = 'hybrid-keyword-plus-llm';
+    } catch (error) {
+      llmFallbackReason = error instanceof Error ? error.message : 'Unknown LLM error';
+    }
+  }
+
   const lines = [
     `Workspace: ${workspaceRoot}`,
     `Playwright objective: ${objective}`,
+    `Catalog size: ${effectiveCatalog.length} guides`,
+    `Selection strategy: ${rankingStrategy}`,
     `Recommendations (top ${ranked.length}):`
   ];
+
+  if (catalogLoad.orgGuideCount > 0) {
+    lines.push(`Organization guides loaded: ${catalogLoad.orgGuideCount}`);
+    if (catalogLoad.orgDocsPath) {
+      lines.push(`Organization guide source: ${catalogLoad.orgDocsPath}`);
+    }
+    if (catalogLoad.orgDocsFolder) {
+      lines.push(`Organization docs folder: ${catalogLoad.orgDocsFolder}`);
+    }
+  }
+  if (catalogLoad.orgLoadWarning) {
+    lines.push(`Organization guide load warning: ${catalogLoad.orgLoadWarning}`);
+  }
+
+  if (llmModel) {
+    lines.push(`LLM model: ${llmModel}`);
+  }
+  if (llmFallbackReason) {
+    lines.push(`LLM rerank skipped: ${llmFallbackReason}`);
+  }
 
   for (const [idx, rec] of ranked.entries()) {
     lines.push(
       `${idx + 1}. ${rec.guide.path} (score=${rec.score}) -> ${rec.guide.title}: ${rec.guide.summary}`
     );
     lines.push(`   Keywords matched: ${rec.matches.join(', ') || 'context similarity'}`);
+    if (rec.reason) {
+      lines.push(`   Why selected: ${rec.reason}`);
+    }
   }
 
   if (includeRules) {
@@ -706,6 +900,19 @@ async function handlePlaywrightSkillAdvisor(args: ToolArgs) {
     JSON.stringify(
       {
         objective,
+        selectionStrategy: rankingStrategy,
+        catalog: {
+          total: effectiveCatalog.length,
+          orgGuideCount: catalogLoad.orgGuideCount,
+          orgDocsPath: catalogLoad.orgDocsPath,
+          orgDocsFolder: catalogLoad.orgDocsFolder,
+          orgLoadWarning: catalogLoad.orgLoadWarning
+        },
+        llm: {
+          mode: llmMode,
+          model: llmModel,
+          fallbackReason: llmFallbackReason
+        },
         recommendations: ranked.map((rec) => ({
           id: rec.guide.id,
           category: rec.guide.category,
@@ -713,7 +920,8 @@ async function handlePlaywrightSkillAdvisor(args: ToolArgs) {
           title: rec.guide.title,
           summary: rec.guide.summary,
           score: rec.score,
-          matchedKeywords: rec.matches
+          matchedKeywords: rec.matches,
+          reason: rec.reason
         })),
         goldenRules: includeRules ? GOLDEN_RULES : []
       },
@@ -725,10 +933,10 @@ async function handlePlaywrightSkillAdvisor(args: ToolArgs) {
   return textResult(lines.join('\n'));
 }
 
-function rankGuidesForObjective(objective: string): Array<{ guide: GuideEntry; score: number; matches: string[] }> {
+function rankGuidesForObjective(objective: string, catalog: GuideEntry[]): RankedGuide[] {
   const normalized = objective.toLowerCase();
 
-  const scored = GUIDE_CATALOG.map((guide) => {
+  const scored = catalog.map((guide) => {
     let score = 0;
     const matches: string[] = [];
 
@@ -773,6 +981,411 @@ function rankGuidesForObjective(objective: string): Array<{ guide: GuideEntry; s
   return scored.sort((a, b) => b.score - a.score || a.guide.path.localeCompare(b.guide.path));
 }
 
+async function getEffectiveCatalog(orgDocsPath: string, orgDocsFolder: string): Promise<{
+  catalog: GuideEntry[];
+  orgGuideCount: number;
+  orgDocsPath?: string;
+  orgDocsFolder?: string;
+  orgLoadWarning?: string;
+}> {
+  const baseCatalog = GUIDE_CATALOG.map((guide) => ({ ...guide, source: 'base' as const }));
+  const resolvedOrgPath = resolveOrgDocsPath(orgDocsPath);
+
+  const resolvedOrgFolder = resolveOrgDocsFolder(orgDocsFolder);
+  const hasJson = resolvedOrgPath ? await fileExists(resolvedOrgPath) : false;
+  const hasFolder = resolvedOrgFolder ? await fileExists(resolvedOrgFolder) : false;
+
+  if (!hasJson && !hasFolder) {
+    return {
+      catalog: baseCatalog,
+      orgGuideCount: 0
+    };
+  }
+
+  try {
+    const orgGuides: GuideEntry[] = [];
+    if (hasJson && resolvedOrgPath) {
+      orgGuides.push(...(await loadOrgGuides(resolvedOrgPath)));
+    }
+    if (hasFolder && resolvedOrgFolder) {
+      orgGuides.push(...(await loadOrgGuidesFromFolder(resolvedOrgFolder)));
+    }
+
+    if (!orgGuides.length) {
+      return {
+        catalog: baseCatalog,
+        orgGuideCount: 0,
+        orgDocsPath: resolvedOrgPath,
+        orgDocsFolder: resolvedOrgFolder,
+        orgLoadWarning: `No valid org guides found in configured org docs sources.`
+      };
+    }
+
+    return {
+      catalog: mergeGuideCatalog(baseCatalog, orgGuides),
+      orgGuideCount: orgGuides.length,
+      orgDocsPath: resolvedOrgPath,
+      orgDocsFolder: resolvedOrgFolder
+    };
+  } catch (error) {
+    return {
+      catalog: baseCatalog,
+      orgGuideCount: 0,
+      orgDocsPath: resolvedOrgPath,
+      orgDocsFolder: resolvedOrgFolder,
+      orgLoadWarning: error instanceof Error ? error.message : 'Unknown org guide load error.'
+    };
+  }
+}
+
+function resolveOrgDocsPath(orgDocsPath: string): string | undefined {
+  const explicit = orgDocsPath.trim();
+  if (explicit) {
+    return path.isAbsolute(explicit) ? explicit : path.resolve(workspaceRoot, explicit);
+  }
+
+  const defaultPath = path.resolve(workspaceRoot, DEFAULT_ORG_DOCS_RELATIVE_PATH);
+  return defaultPath;
+}
+
+function resolveOrgDocsFolder(orgDocsFolder: string): string | undefined {
+  const explicit = orgDocsFolder.trim();
+  if (explicit) {
+    return path.isAbsolute(explicit) ? explicit : path.resolve(workspaceRoot, explicit);
+  }
+
+  return undefined;
+}
+
+async function fileExists(targetPath: string): Promise<boolean> {
+  try {
+    await fs.access(targetPath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function loadOrgGuides(filePath: string): Promise<GuideEntry[]> {
+  const raw = await fs.readFile(filePath, 'utf-8');
+  const parsed = JSON.parse(raw) as unknown;
+
+  if (!Array.isArray(parsed)) {
+    throw new Error(`Org guides file must be a JSON array: ${filePath}`);
+  }
+
+  const guides: GuideEntry[] = [];
+  for (const item of parsed) {
+    const entry = asObject(item);
+    if (!entry) {
+      continue;
+    }
+
+    const id = asString(entry.id)?.trim();
+    const title = asString(entry.title)?.trim();
+    const summary = asString(entry.summary)?.trim();
+    const guidePath = asString(entry.path)?.trim();
+    const category = asGuideCategory(entry.category);
+    const rawKeywords = Array.isArray(entry.keywords) ? entry.keywords : [];
+    const keywords = rawKeywords
+      .map((keyword) => asString(keyword)?.trim())
+      .filter((keyword): keyword is string => Boolean(keyword));
+
+    if (!id || !title || !summary || !guidePath || !category || !keywords.length) {
+      continue;
+    }
+
+    guides.push({
+      id,
+      category,
+      path: guidePath,
+      title,
+      summary,
+      keywords: unique(keywords),
+      source: 'org'
+    });
+  }
+
+  return guides;
+}
+
+async function loadOrgGuidesFromFolder(folderPath: string): Promise<GuideEntry[]> {
+  const markdownFiles = await listMarkdownFiles(folderPath);
+  const guides: GuideEntry[] = [];
+
+  for (const filePath of markdownFiles) {
+    const raw = await fs.readFile(filePath, 'utf-8');
+    const relPath = toPosixPath(path.relative(workspaceRoot, filePath));
+    const title = extractMarkdownTitle(raw) || titleFromPath(filePath);
+    const summary = extractMarkdownSummary(raw);
+    const category = inferCategoryFromPath(relPath);
+    const keywords = unique([
+      ...tokenizeText(title),
+      ...tokenizeText(summary),
+      ...tokenizeText(relPath),
+      category
+    ]);
+
+    guides.push({
+      id: `org-${slugify(relPath)}`,
+      category,
+      path: relPath,
+      title,
+      summary,
+      keywords,
+      source: 'org'
+    });
+  }
+
+  return guides;
+}
+
+async function listMarkdownFiles(folderPath: string): Promise<string[]> {
+  const entries = await fs.readdir(folderPath, { withFileTypes: true });
+  const results: string[] = [];
+
+  for (const entry of entries) {
+    const fullPath = path.join(folderPath, entry.name);
+    if (entry.isDirectory()) {
+      results.push(...(await listMarkdownFiles(fullPath)));
+      continue;
+    }
+    if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) {
+      results.push(fullPath);
+    }
+  }
+
+  return results;
+}
+
+function mergeGuideCatalog(baseCatalog: GuideEntry[], orgCatalog: GuideEntry[]): GuideEntry[] {
+  const merged = new Map<string, GuideEntry>();
+
+  for (const baseGuide of baseCatalog) {
+    merged.set(baseGuide.id, baseGuide);
+  }
+
+  for (const orgGuide of orgCatalog) {
+    merged.set(orgGuide.id, orgGuide);
+  }
+
+  return Array.from(merged.values()).sort((a, b) => a.path.localeCompare(b.path));
+}
+
+function enrichGuideCatalog(catalog: GuideEntry[]): GuideEntry[] {
+  return catalog.map((guide) => {
+    const override = GUIDE_DETAIL_OVERRIDES[guide.id];
+    const categoryKeywords = CATEGORY_KEYWORDS[guide.category] ?? [];
+    const generatedKeywords = tokenizeGuideText(guide);
+
+    return {
+      ...guide,
+      summary: override?.summary || `${guide.summary} Includes practical implementation details and troubleshooting cues for real-world projects.`,
+      keywords: unique([
+        ...guide.keywords,
+        ...categoryKeywords,
+        ...generatedKeywords,
+        ...(override?.keywords ?? [])
+      ])
+    };
+  });
+}
+
+function tokenizeGuideText(guide: GuideEntry): string[] {
+  const stopWords = new Set([
+    'and',
+    'for',
+    'with',
+    'the',
+    'from',
+    'test',
+    'tests',
+    'playwright',
+    'core'
+  ]);
+
+  const rawTokens = `${guide.title} ${guide.path}`
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, ' ')
+    .split(/[\s/-]+/)
+    .filter((token) => token.length >= 3 && !stopWords.has(token));
+
+  return unique(rawTokens);
+}
+
+async function rerankWithExternalLlm(
+  objective: string,
+  candidates: RankedGuide[],
+  topK: number
+): Promise<LlmRerankResult> {
+  if (!candidates.length) {
+    throw new Error('No candidates available for LLM reranking.');
+  }
+
+  const config = getExternalLlmConfig();
+  const payload = {
+    model: config.model,
+    temperature: 0,
+    messages: [
+      {
+        role: 'system',
+        content:
+          'You rank Playwright documentation guides for a test objective. Return strict JSON only.'
+      },
+      {
+        role: 'user',
+        content: JSON.stringify(
+          {
+            task: 'Rank the most important guides for this objective.',
+            objective,
+            outputSchema: {
+              orderedIds: ['guide-id-1', 'guide-id-2'],
+              reasons: {
+                'guide-id-1': 'Short reason tied to objective.'
+              }
+            },
+            constraints: [
+              'Return only valid JSON object, no markdown.',
+              `Use only ids from candidates list.`,
+              `Rank exactly ${Math.min(topK, candidates.length)} ids if possible.`
+            ],
+            candidates: candidates.map((candidate) => ({
+              id: candidate.guide.id,
+              path: candidate.guide.path,
+              category: candidate.guide.category,
+              title: candidate.guide.title,
+              summary: candidate.guide.summary,
+              keywords: candidate.guide.keywords,
+              keywordScore: candidate.score,
+              matchedKeywords: candidate.matches
+            }))
+          },
+          null,
+          2
+        )
+      }
+    ]
+  };
+
+  const response = await fetch(config.apiUrl, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bearer ${config.apiKey}`
+    },
+    body: JSON.stringify(payload)
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`LLM HTTP ${response.status}: ${errorText.slice(0, 200)}`);
+  }
+
+  const responseJson = (await response.json()) as {
+    choices?: Array<{ message?: { content?: string } }>;
+  };
+  const content = responseJson.choices?.[0]?.message?.content;
+  if (!content) {
+    throw new Error('LLM response did not include assistant content.');
+  }
+
+  const parsed = parseJsonObject(content);
+  const orderedIds = Array.isArray(parsed.orderedIds)
+    ? parsed.orderedIds.map((item) => asString(item)).filter((item): item is string => Boolean(item))
+    : [];
+  if (!orderedIds.length) {
+    throw new Error('LLM response did not include valid orderedIds.');
+  }
+
+  const reasonMap: Record<string, string> = {};
+  const reasons = asObject(parsed.reasons);
+  if (reasons) {
+    for (const [id, reasonValue] of Object.entries(reasons)) {
+      const reason = asString(reasonValue);
+      if (reason) {
+        reasonMap[id] = reason;
+      }
+    }
+  }
+
+  const byId = new Map(candidates.map((candidate) => [candidate.guide.id, candidate]));
+  const orderedUnique = unique(orderedIds).filter((id) => byId.has(id));
+  const selectedIds = orderedUnique.slice(0, topK);
+  if (!selectedIds.length) {
+    throw new Error('LLM response did not reference candidate ids.');
+  }
+
+  const recommendations = selectedIds.map((id, index) => {
+    const base = byId.get(id);
+    if (!base) {
+      throw new Error(`Internal ranking error for guide id: ${id}`);
+    }
+
+    return {
+      guide: base.guide,
+      matches: base.matches,
+      score: base.score + (selectedIds.length - index) * 10,
+      reason: reasonMap[id]
+    } satisfies RankedGuide;
+  });
+
+  return {
+    recommendations,
+    model: config.model
+  };
+}
+
+function getExternalLlmConfig(): ExternalLlmConfig {
+  const apiUrl = process.env.PLAYWRIGHT_TOOL_LLM_API_URL;
+  const apiKey = process.env.PLAYWRIGHT_TOOL_LLM_API_KEY;
+  const model = process.env.PLAYWRIGHT_TOOL_LLM_MODEL || DEFAULT_LLM_MODEL;
+
+  if (!apiUrl || !apiKey) {
+    throw new Error(
+      'Missing LLM env vars. Set PLAYWRIGHT_TOOL_LLM_API_URL and PLAYWRIGHT_TOOL_LLM_API_KEY for llmMode=external.'
+    );
+  }
+
+  return { apiUrl, apiKey, model };
+}
+
+function parseLlmMode(value: string | undefined): LlmMode {
+  const normalized = (value || process.env.PLAYWRIGHT_TOOL_LLM_MODE || DEFAULT_LLM_MODE)
+    .toLowerCase()
+    .trim();
+  if (normalized === 'external') {
+    return 'external';
+  }
+  return 'off';
+}
+
+function parseJsonObject(value: string): Record<string, unknown> {
+  try {
+    const parsed = JSON.parse(value) as unknown;
+    const parsedObject = asObject(parsed);
+    if (parsedObject) {
+      return parsedObject;
+    }
+  } catch {
+    // Continue with best-effort extraction below.
+  }
+
+  const start = value.indexOf('{');
+  const end = value.lastIndexOf('}');
+  if (start < 0 || end <= start) {
+    throw new Error('LLM response is not valid JSON.');
+  }
+
+  const sliced = value.slice(start, end + 1);
+  const parsed = JSON.parse(sliced) as unknown;
+  const parsedObject = asObject(parsed);
+  if (!parsedObject) {
+    throw new Error('LLM response JSON must be an object.');
+  }
+
+  return parsedObject;
+}
+
 function groupByCategory(catalog: GuideEntry[]): Record<GuideCategory, GuideEntry[]> {
   const grouped: Record<GuideCategory, GuideEntry[]> = {
     core: [],
@@ -807,6 +1420,84 @@ function parseTriggeredObjective(userInput: string): string | undefined {
   return (match[1] || '').trim();
 }
 
+function isOrgDocsHelpIntent(objective: string): boolean {
+  const normalized = objective.toLowerCase();
+  const hasDocs = normalized.includes('doc') || normalized.includes('md') || normalized.includes('markdown');
+  const hasFolder = normalized.includes('folder') || normalized.includes('directory');
+  const hasAddIntent = normalized.includes('add') || normalized.includes('use') || normalized.includes('include');
+  return hasDocs && hasFolder && hasAddIntent;
+}
+
+function inferCategoryFromPath(relPath: string): GuideCategory {
+  const normalized = relPath.toLowerCase();
+  if (normalized.includes('/ci/') || normalized.includes('ci')) {
+    return 'ci';
+  }
+  if (normalized.includes('/pom/') || normalized.includes('page-object')) {
+    return 'pom';
+  }
+  if (normalized.includes('/migration/') || normalized.includes('migrate')) {
+    return 'migration';
+  }
+  if (normalized.includes('/playwright-cli/') || normalized.includes('cli')) {
+    return 'playwright-cli';
+  }
+  if (normalized.includes('/architecture/') || normalized.includes('architecture')) {
+    return 'architecture';
+  }
+  return 'core';
+}
+
+function extractMarkdownTitle(markdown: string): string | undefined {
+  const match = markdown.match(/^\s*#\s+(.+)$/m);
+  return match?.[1]?.trim();
+}
+
+function extractMarkdownSummary(markdown: string): string {
+  const lines = markdown
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !line.startsWith('#') && !line.startsWith('```') && !line.startsWith('- '));
+
+  const joined = lines.slice(0, 2).join(' ').trim();
+  if (!joined) {
+    return 'Organization Playwright guide imported from markdown docs folder.';
+  }
+
+  return joined.length > 240 ? `${joined.slice(0, 237)}...` : joined;
+}
+
+function titleFromPath(filePath: string): string {
+  const basename = path.basename(filePath, path.extname(filePath));
+  return basename
+    .split(/[-_\s]+/)
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function tokenizeText(text: string): string[] {
+  const stopWords = new Set(['the', 'and', 'for', 'with', 'from', 'this', 'that', 'playwright']);
+  return unique(
+    text
+      .toLowerCase()
+      .replace(/[^a-z0-9\s-]/g, ' ')
+      .split(/[\s/_-]+/)
+      .filter((token) => token.length >= 3 && !stopWords.has(token))
+  );
+}
+
+function slugify(value: string): string {
+  return value
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function toPosixPath(filePath: string): string {
+  return filePath.replace(/\\/g, '/');
+}
+
 function asString(value: unknown): string | undefined {
   return typeof value === 'string' ? value : undefined;
 }
@@ -817,6 +1508,29 @@ function asNumber(value: unknown): number | undefined {
 
 function asBoolean(value: unknown): boolean | undefined {
   return typeof value === 'boolean' ? value : undefined;
+}
+
+function asGuideCategory(value: unknown): GuideCategory | undefined {
+  const category = asString(value)?.trim();
+  if (
+    category === 'core' ||
+    category === 'ci' ||
+    category === 'pom' ||
+    category === 'migration' ||
+    category === 'playwright-cli' ||
+    category === 'architecture'
+  ) {
+    return category;
+  }
+
+  return undefined;
+}
+
+function asObject(value: unknown): Record<string, unknown> | undefined {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    return undefined;
+  }
+  return value as Record<string, unknown>;
 }
 
 function unique(items: string[]): string[] {

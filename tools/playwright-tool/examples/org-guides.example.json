@@ -1,0 +1,30 @@
+[
+  {
+    "id": "org-authz-admin-flow",
+    "category": "core",
+    "path": "docs/testing/admin-authz-flow.md",
+    "title": "Admin Authorization Flow",
+    "summary": "Organization policy for testing admin-only actions, approval boundaries, and audit log verification.",
+    "keywords": [
+      "authorization",
+      "admin role",
+      "rbac",
+      "audit log",
+      "permission boundary"
+    ]
+  },
+  {
+    "id": "org-ci-playwright-policy",
+    "category": "ci",
+    "path": "docs/testing/ci-playwright-policy.md",
+    "title": "Playwright CI Policy",
+    "summary": "Team CI standards for retries, traces, artifacts, and flaky-test quarantine workflows.",
+    "keywords": [
+      "ci",
+      "retry policy",
+      "trace retention",
+      "artifact policy",
+      "flaky quarantine"
+    ]
+  }
+]
