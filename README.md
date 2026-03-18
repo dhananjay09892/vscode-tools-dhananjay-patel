@@ -12,12 +12,7 @@ We truly love and respect the software developer community, and this project is 
 
 ## Tool Folders
 
-- `tools/codebase-integration-tool`
-- `tools/internal-api-generator`
-- `tools/repo-intelligence-tool`
-- `tools/code-quality-enforcer`
 - `tools/architecture-validator`
-- `tools/dependency-analyzer`
 - `tools/code-architecture-toolkit`
 - `tools/tool-reception`
 - `tools/playwright-tool`
@@ -25,7 +20,7 @@ We truly love and respect the software developer community, and this project is 
 ## Suggested Build Order
 
 1. Build a shared extension shell or MCP server foundation.
-2. Implement one tool end-to-end (recommended: internal API generator).
+2. Implement one tool end-to-end (recommended: tool-reception).
 3. Reuse shared logic for file scanning, code edits, and validation across all tools.
 
 ## New Developer Integration
