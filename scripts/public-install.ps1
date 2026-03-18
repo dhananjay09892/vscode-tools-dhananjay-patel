@@ -2,7 +2,7 @@
   [string]$ToolkitRepoUrl = $env:TOOLKIT_REPO_URL,
   [string]$TargetRepoPath = (Get-Location).Path,
   [string]$ToolId = $env:TOOLKIT_TOOL_ID,
-  [string]$ServerName = 'internal-dev-agent',
+  [string]$ServerName = $env:TOOLKIT_SERVER_NAME,
   [string]$Branch = 'main',
   [switch]$KeepTemp
 )
@@ -99,6 +99,11 @@ if ($null -eq $supportedTools -or $supportedTools.Count -eq 0) {
 
 if ([string]::IsNullOrWhiteSpace($ToolId)) {
   $ToolId = $registry.defaultToolId
+}
+
+if ([string]::IsNullOrWhiteSpace($ServerName)) {
+  # Use a stable per-tool server name so installing multiple tools does not overwrite mcp.json entries.
+  $ServerName = "$ToolId-server"
 }
 
 if (-not $supportedTools.ContainsKey($ToolId)) {

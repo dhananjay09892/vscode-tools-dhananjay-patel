@@ -93,6 +93,11 @@ npm --prefix tools/code-architecture-toolkit run smoke; npm --prefix tools/code-
 
 Tool registry is manifest-driven at `scripts/tool-registry.json`, so adding more tools does not require installer logic changes.
 
+Installer note:
+
+- `public-install.ps1` now auto-selects a unique MCP server name per tool (`<tool-id>-server`) when `-ServerName` is not provided.
+- This prevents one tool install from overwriting another in `.vscode/mcp.json`.
+
 ### One command (current)
 
 From this repo:
