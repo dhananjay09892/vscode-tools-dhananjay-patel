@@ -57,3 +57,4 @@ OtherData/
 # Temporary scratch files
 *.tmp
 *.temp
+.*/

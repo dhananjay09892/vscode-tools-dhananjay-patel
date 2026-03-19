@@ -16,6 +16,10 @@ We truly love and respect the software developer community, and this project is 
 - `tools/code-architecture-toolkit`
 - `tools/tool-reception`
 - `tools/playwright-tool`
+- `tools/webscraper-tool`
+- `tools/scrape-markdown-tool`
+- `tools/scrape-pipeline-tool`
+- `tools/backend-api-contract-guardian`
 
 ## Suggested Build Order
 
@@ -69,6 +73,30 @@ Public GitHub onboarding (playwright-tool):
 
 ```powershell
 $env:TOOLKIT_REPO_URL="https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git"; $env:TOOLKIT_TOOL_ID="playwright-tool"; $u="https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1?v=20260317"; $s=Join-Path $env:TEMP "public-install.ps1"; iwr $u -UseBasicParsing -OutFile $s; & $s
+```
+
+Public GitHub onboarding (webscraper-tool):
+
+```powershell
+$env:TOOLKIT_REPO_URL="https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git"; $env:TOOLKIT_TOOL_ID="webscraper-tool"; $u="https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1?v=20260317"; $s=Join-Path $env:TEMP "public-install.ps1"; iwr $u -UseBasicParsing -OutFile $s; & $s
+```
+
+Public GitHub onboarding (scrape-markdown-tool):
+
+```powershell
+$env:TOOLKIT_REPO_URL="https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git"; $env:TOOLKIT_TOOL_ID="scrape-markdown-tool"; $u="https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1?v=20260317"; $s=Join-Path $env:TEMP "public-install.ps1"; iwr $u -UseBasicParsing -OutFile $s; & $s
+```
+
+Public GitHub onboarding (scrape-pipeline-tool):
+
+```powershell
+$env:TOOLKIT_REPO_URL="https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git"; $env:TOOLKIT_TOOL_ID="scrape-pipeline-tool"; $u="https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1?v=20260317"; $s=Join-Path $env:TEMP "public-install.ps1"; iwr $u -UseBasicParsing -OutFile $s; & $s
+```
+
+Public GitHub onboarding (backend-api-contract-guardian):
+
+```powershell
+$env:TOOLKIT_REPO_URL="https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git"; $env:TOOLKIT_TOOL_ID="backend-api-contract-guardian"; $u="https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1?v=20260317"; $s=Join-Path $env:TEMP "public-install.ps1"; iwr $u -UseBasicParsing -OutFile $s; & $s
 ```
 
 
@@ -155,6 +183,10 @@ Current supported ToolId values:
 - architecture-validator
 - tool-reception
 - playwright-tool
+- webscraper-tool
+- scrape-markdown-tool
+- scrape-pipeline-tool
+- backend-api-contract-guardian
 
 After running, verify output includes: `public-install.ps1 version: 2026-03-17.1`
 

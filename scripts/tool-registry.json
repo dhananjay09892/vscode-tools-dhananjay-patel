@@ -28,6 +28,34 @@
       "kind": "mcp-server",
       "installCommand": "install",
       "buildCommand": "build"
+    },
+    "webscraper-tool": {
+      "sourceSubPath": "tools/webscraper-tool",
+      "installSubPath": ".copilot-tools/webscraper-tool",
+      "kind": "mcp-server",
+      "installCommand": "install",
+      "buildCommand": "build"
+    },
+    "scrape-markdown-tool": {
+      "sourceSubPath": "tools/scrape-markdown-tool",
+      "installSubPath": ".copilot-tools/scrape-markdown-tool",
+      "kind": "mcp-server",
+      "installCommand": "install",
+      "buildCommand": "build"
+    },
+    "scrape-pipeline-tool": {
+      "sourceSubPath": "tools/scrape-pipeline-tool",
+      "installSubPath": ".copilot-tools/scrape-pipeline-tool",
+      "kind": "mcp-server",
+      "installCommand": "install",
+      "buildCommand": "build"
+    },
+    "backend-api-contract-guardian": {
+      "sourceSubPath": "tools/backend-api-contract-guardian",
+      "installSubPath": ".copilot-tools/backend-api-contract-guardian",
+      "kind": "mcp-server",
+      "installCommand": "install",
+      "buildCommand": "build"
     }
   }
 }
