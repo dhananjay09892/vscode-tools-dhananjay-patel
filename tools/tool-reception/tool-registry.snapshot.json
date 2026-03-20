@@ -4,13 +4,25 @@
     "architecture-validator": {
       "kind": "vscode-extension"
     },
+    "backend-api-contract-guardian": {
+      "kind": "mcp-server"
+    },
     "code-architecture-toolkit": {
       "kind": "mcp-server"
     },
     "playwright-tool": {
       "kind": "mcp-server"
     },
+    "scrape-markdown-tool": {
+      "kind": "mcp-server"
+    },
+    "scrape-pipeline-tool": {
+      "kind": "mcp-server"
+    },
     "tool-reception": {
+      "kind": "mcp-server"
+    },
+    "webscraper-tool": {
       "kind": "mcp-server"
     }
   }
