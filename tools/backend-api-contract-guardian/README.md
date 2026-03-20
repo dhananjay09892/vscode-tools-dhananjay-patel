@@ -36,13 +36,21 @@ It verifies security declarations and OAuth scope usage so protected operations 
 
 It warns on missing idempotency-key and pagination contract hints for retry-sensitive or list-like endpoints.
 
-## What it validates (MVP)
+## What it validates
 
 - Governance checks (`GOV-*`): required OpenAPI fields, operation IDs.
 - Error checks (`ER-*`): `application/problem+json` coverage and required problem fields.
 - Security checks (`SEC-*`): operation security presence and OAuth scope usage.
 - Reliability checks (`REL-*`): idempotency-key and pagination contract hints.
 - Breaking checks (`BC-*`) when baseline and candidate specs are both provided.
+
+## Reporting ergonomics
+
+- Findings are grouped by `ruleId` and by inferred router/module (first path segment).
+- Reports include a concise executive summary with top risks and impacted endpoint counts.
+- Breaking-change findings are clearly separated from policy/governance findings.
+- Quick-fix templates are embedded for high-frequency rules (for example `ER-002`, `ER-003`, `REL-003`).
+- Optional suppression files support phased rollout with temporary accepted exceptions.
 
 ## Tool
 
@@ -52,7 +60,9 @@ It warns on missing idempotency-key and pagination contract hints for retry-sens
 
 - `specPath`: path to candidate OpenAPI file (required)
 - `baselineSpecPath`: path to baseline OpenAPI file (optional)
-- `mode`: `strict` | `balanced` | `legacy` (optional, default `balanced`)
+- `mode`: `strict` | `balanced` | `advisory` | `legacy` (optional, default `balanced`)
+- `summaryMode`: `full` | `executive` (optional, default `full`)
+- `suppressionsPath`: path to JSON/YAML suppression file (optional)
 - `outputDir`: optional folder to write `report.json` and `report.md`
 
 ## Core use cases
@@ -97,7 +107,9 @@ Example input payload:
 {
 	"specPath": "openapi/openapi.candidate.yaml",
 	"baselineSpecPath": "openapi/openapi.baseline.yaml",
-	"mode": "strict",
+	"mode": "balanced",
+	"summaryMode": "executive",
+	"suppressionsPath": "openapi/guardian-suppressions.json",
 	"outputDir": ".reports/api-guardian"
 }
 ```
@@ -121,7 +133,34 @@ Recommended rollout:
 
 - `strict`: blocks on any `error` finding.
 - `balanced`: blocks on `error` findings in breaking, error model, and security categories.
+- `advisory`: never blocks; emits findings for guided rollout.
 - `legacy`: blocks only compatibility-critical subset for gradual adoption.
+
+## Suppression file format
+
+Suppression files can be either:
+
+- an array of suppression rules, or
+- an object with a `suppressions` array.
+
+Example:
+
+```json
+{
+	"suppressions": [
+		{
+			"ruleId": "ER-002",
+			"locationContains": "/internal/",
+			"reason": "Temporary exception during migration"
+		},
+		{
+			"category": "reliability",
+			"messageContains": "pagination",
+			"reason": "Phase 1 rollout"
+		}
+	]
+}
+```
 
 ## Example finding to action mapping
 

@@ -1,6 +1,8 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -12,8 +14,10 @@ import {
 const SERVER_NAME = 'tool-reception';
 const SERVER_VERSION = '0.0.1';
 const INSTALL_CONFIRM_TOKEN = 'CONFIRM_INSTALL';
+const UPDATE_CONFIRM_TOKEN = 'CONFIRM_UPDATE';
 const DEFAULT_INSTALLER_REPO_URL = 'https://github.com/dhananjay09892/vscode-tools-dhananjay-patel.git';
 const DEFAULT_INSTALLER_VERSION = '20260317';
+const execFileAsync = promisify(execFile);
 
 type ToolArgs = Record<string, unknown>;
 
@@ -32,7 +36,12 @@ interface ToolCatalogEntry {
 
 interface ToolRegistryShape {
   defaultToolId?: string;
-  tools?: Record<string, { kind?: string }>;
+  tools?: Record<string, ToolRegistryEntry>;
+}
+
+interface ToolRegistryEntry {
+  kind?: string;
+  installSubPath?: string;
 }
 
 type ToolMetadata = Omit<ToolCatalogEntry, 'toolId' | 'displayName' | 'category' | 'onboarding'>;
@@ -71,6 +80,7 @@ const __dirname = path.dirname(__filename);
 const toolRoot = path.resolve(__dirname, '..');
 
 const workspaceRoot = path.resolve(process.env.WORKSPACE_ROOT ?? process.cwd());
+const UPDATE_STATE_FILE = path.join(workspaceRoot, '.copilot-tools', 'tool-reception', 'update-state.json');
 const MIN_RECOMMENDATION_SCORE = 4;
 let toolCatalogCache: ToolCatalogEntry[] | undefined;
 let toolMetadataCache: ToolMetadataMap | undefined;
@@ -135,6 +145,27 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
               type: 'string',
               description:
                 'Optional cache-bust version token for public-install.ps1 URL. Default matches project README snippet.'
+            },
+            autoUpdate: {
+              type: 'boolean',
+              description:
+                'When objective asks to update tools, run updates for installed tools after explicit confirmation.'
+            },
+            confirmUpdate: {
+              type: 'string',
+              description:
+                `Explicit safety confirmation token required with autoUpdate=true. Expected value: ${UPDATE_CONFIRM_TOKEN}`
+            },
+            updateScope: {
+              type: 'string',
+              enum: ['installed', 'all'],
+              description:
+                'Controls update target set. installed updates only tools present in .copilot-tools; all updates entire registry.'
+            },
+            skipGitHubCheck: {
+              type: 'boolean',
+              description:
+                'Optional offline mode for update intent: skip remote GitHub latest check and only build update handoff.'
             }
           }
         }
@@ -197,8 +228,26 @@ async function handleToolReception(args: ToolArgs) {
   const topK = Math.max(1, Math.min(10, asNumber(args.topK) ?? 3));
   const autoInstall = asBoolean(args.autoInstall) ?? false;
   const confirmInstall = (asString(args.confirmInstall) || '').trim();
+  const autoUpdate = asBoolean(args.autoUpdate) ?? false;
+  const confirmUpdate = (asString(args.confirmUpdate) || '').trim();
+  const updateScope = ((asString(args.updateScope) || 'installed').trim().toLowerCase() === 'all' ? 'all' : 'installed') as
+    | 'installed'
+    | 'all';
+  const skipGitHubCheck = asBoolean(args.skipGitHubCheck) ?? false;
   const installerRepoUrl = (asString(args.installerRepoUrl) || DEFAULT_INSTALLER_REPO_URL).trim();
   const installerVersion = (asString(args.installerVersion) || DEFAULT_INSTALLER_VERSION).trim();
+
+  if (isUpdateIntent(objective)) {
+    return handleUpdateToolsIntent({
+      objective,
+      autoUpdate,
+      confirmUpdate,
+      updateScope,
+      installerRepoUrl,
+      installerVersion,
+      skipGitHubCheck
+    });
+  }
 
   if (!objective) {
     const lines = [
@@ -585,6 +634,221 @@ function confidenceLabel(score: number): 'high' | 'medium' | 'low' {
 
 function buildPublicInstallCommand(toolId: string, repoUrl: string, versionToken: string): string {
   return `$env:TOOLKIT_REPO_URL="${repoUrl}"; $env:TOOLKIT_TOOL_ID="${toolId}"; $u="https://raw.githubusercontent.com/dhananjay09892/vscode-tools-dhananjay-patel/main/scripts/public-install.ps1?v=${versionToken}"; $s=Join-Path $env:TEMP "public-install.ps1"; iwr $u -UseBasicParsing -OutFile $s; & $s`;
+}
+
+function isUpdateIntent(objective: string): boolean {
+  const normalized = normalizeText(objective);
+  return (
+    normalized.includes('update tool') ||
+    normalized.includes('update tools') ||
+    normalized.includes('upgrade tool') ||
+    normalized.includes('upgrade tools') ||
+    normalized.includes('refresh tools')
+  );
+}
+
+function parseGithubRepo(repoUrl: string): { owner: string; repo: string } | undefined {
+  const match = repoUrl.match(/github\.com[/:]([^/]+)\/([^/.]+)(?:\.git)?$/i);
+  if (!match) {
+    return undefined;
+  }
+  return {
+    owner: match[1],
+    repo: match[2]
+  };
+}
+
+async function fetchLatestCommitSha(repoUrl: string): Promise<string | undefined> {
+  const parsed = parseGithubRepo(repoUrl);
+  if (!parsed) {
+    return undefined;
+  }
+
+  try {
+    const response = await fetch(`https://api.github.com/repos/${parsed.owner}/${parsed.repo}/commits/main`, {
+      headers: {
+        Accept: 'application/vnd.github+json',
+        'User-Agent': 'tool-reception'
+      }
+    });
+    if (!response.ok) {
+      return undefined;
+    }
+
+    const body = (await response.json()) as { sha?: string };
+    return typeof body.sha === 'string' && body.sha.length > 0 ? body.sha : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function readUpdateState(): Promise<{ lastUpdatedSha?: string; lastUpdatedAt?: string }> {
+  try {
+    const raw = await fs.readFile(UPDATE_STATE_FILE, 'utf-8');
+    const parsed = JSON.parse(raw) as { lastUpdatedSha?: unknown; lastUpdatedAt?: unknown };
+    return {
+      lastUpdatedSha: typeof parsed.lastUpdatedSha === 'string' ? parsed.lastUpdatedSha : undefined,
+      lastUpdatedAt: typeof parsed.lastUpdatedAt === 'string' ? parsed.lastUpdatedAt : undefined
+    };
+  } catch {
+    return {};
+  }
+}
+
+async function writeUpdateState(state: { lastUpdatedSha?: string; lastUpdatedAt: string }): Promise<void> {
+  await fs.mkdir(path.dirname(UPDATE_STATE_FILE), { recursive: true });
+  await fs.writeFile(UPDATE_STATE_FILE, `${JSON.stringify(state, null, 2)}\n`, 'utf-8');
+}
+
+async function runPowerShellCommand(command: string): Promise<{ success: boolean; output: string }> {
+  try {
+    const { stdout, stderr } = await execFileAsync('powershell', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', command], {
+      cwd: workspaceRoot,
+      maxBuffer: 1024 * 1024 * 8
+    });
+    const output = [stdout, stderr].filter(Boolean).join('\n').trim();
+    return { success: true, output };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return { success: false, output: message };
+  }
+}
+
+async function getInstallTargets(scope: 'installed' | 'all'): Promise<string[]> {
+  const registry = await readRegistry(path.join(workspaceRoot, 'scripts', 'tool-registry.json'));
+  const tools = registry?.tools ?? {};
+  const toolIds = Object.keys(tools).sort((a, b) => a.localeCompare(b));
+  if (scope === 'all') {
+    return toolIds;
+  }
+
+  const installed: string[] = [];
+  for (const toolId of toolIds) {
+    const spec = tools[toolId];
+    const installSubPath = spec?.installSubPath;
+    if (!installSubPath) {
+      continue;
+    }
+
+    const installPath = path.join(workspaceRoot, installSubPath);
+    try {
+      await fs.access(installPath);
+      installed.push(toolId);
+    } catch {
+      // Ignore missing tool folders.
+    }
+  }
+
+  return installed;
+}
+
+async function handleUpdateToolsIntent(input: {
+  objective: string;
+  autoUpdate: boolean;
+  confirmUpdate: string;
+  updateScope: 'installed' | 'all';
+  installerRepoUrl: string;
+  installerVersion: string;
+  skipGitHubCheck: boolean;
+}) {
+  const targets = await getInstallTargets(input.updateScope);
+  const state = await readUpdateState();
+  const latestSha = input.skipGitHubCheck ? undefined : await fetchLatestCommitSha(input.installerRepoUrl);
+  const updateNeeded = !latestSha || !state.lastUpdatedSha || state.lastUpdatedSha !== latestSha;
+
+  const lines: string[] = [];
+  lines.push(`Workspace: ${workspaceRoot}`);
+  lines.push(`Tool Reception objective: ${input.objective}`);
+  lines.push(`Update scope: ${input.updateScope}`);
+  lines.push(`Detected installed target tools: ${targets.length}`);
+
+  if (!input.skipGitHubCheck) {
+    lines.push(`Latest GitHub commit (main): ${latestSha ?? 'unavailable'}`);
+    lines.push(`Last applied commit: ${state.lastUpdatedSha ?? 'none'}`);
+    lines.push(`Update needed: ${updateNeeded}`);
+  } else {
+    lines.push('GitHub check: skipped (skipGitHubCheck=true).');
+  }
+
+  if (targets.length === 0) {
+    lines.push('No installed tools found for update. Install at least one toolkit tool first.');
+    return textResult(lines.join('\n'));
+  }
+
+  const commands = targets.map((toolId) => ({
+    toolId,
+    command: buildPublicInstallCommand(toolId, input.installerRepoUrl, input.installerVersion)
+  }));
+
+  if (!input.autoUpdate) {
+    lines.push('Update handoff: ready to execute after explicit confirmation.');
+    lines.push(`Set autoUpdate=true and confirmUpdate="${UPDATE_CONFIRM_TOKEN}" to run updates now.`);
+    lines.push('Planned update commands:');
+    for (const item of commands) {
+      lines.push(`- ${item.toolId}: ${item.command}`);
+    }
+    lines.push('Update JSON:');
+    lines.push(
+      JSON.stringify(
+        {
+          updateIntent: true,
+          updateNeeded,
+          latestSha,
+          previousSha: state.lastUpdatedSha,
+          targets,
+          confirmationToken: UPDATE_CONFIRM_TOKEN
+        },
+        null,
+        2
+      )
+    );
+    return textResult(lines.join('\n'));
+  }
+
+  if (input.confirmUpdate !== UPDATE_CONFIRM_TOKEN) {
+    lines.push('Update execution blocked: confirmation token missing or invalid.');
+    lines.push(`Provide confirmUpdate="${UPDATE_CONFIRM_TOKEN}" with autoUpdate=true.`);
+    return textResult(lines.join('\n'));
+  }
+
+  const results: Array<{ toolId: string; success: boolean; output: string }> = [];
+  for (const item of commands) {
+    const run = await runPowerShellCommand(item.command);
+    results.push({ toolId: item.toolId, success: run.success, output: run.output });
+  }
+
+  const successCount = results.filter((r) => r.success).length;
+  const failCount = results.length - successCount;
+  lines.push(`Update execution completed: success=${successCount}, failed=${failCount}`);
+  for (const result of results) {
+    lines.push(`- ${result.toolId}: ${result.success ? 'updated' : 'failed'}`);
+  }
+
+  if (failCount === 0) {
+    await writeUpdateState({
+      lastUpdatedSha: latestSha,
+      lastUpdatedAt: new Date().toISOString()
+    });
+  }
+
+  lines.push('Update JSON:');
+  lines.push(
+    JSON.stringify(
+      {
+        updateIntent: true,
+        updateNeeded,
+        latestSha,
+        previousSha: state.lastUpdatedSha,
+        successCount,
+        failCount,
+        results: results.map((r) => ({ toolId: r.toolId, success: r.success }))
+      },
+      null,
+      2
+    )
+  );
+
+  return textResult(lines.join('\n'));
 }
 
 async function main() {

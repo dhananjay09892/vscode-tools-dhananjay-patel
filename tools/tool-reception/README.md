@@ -15,6 +15,7 @@ Provide a single entry point that helps developers discover all tools and get re
 - Explains why each recommendation matched.
 - Returns both human-readable output and machine-readable JSON.
 - Supports explicit slash-trigger mode so users control when this tool runs.
+- Supports "update tools" intent that checks GitHub freshness and prepares or runs updates.
 
 ## Recommended User Experience
 
@@ -79,12 +80,29 @@ Run from this tool folder:
 - Optional input: `confirmInstall="CONFIRM_INSTALL"` required with `autoInstall=true`.
 - Optional input: `installerRepoUrl` to override default public installer repository URL.
 - Optional input: `installerVersion` to override cache-bust version token for installer URL.
+- Optional input: `autoUpdate=true` to execute updates when objective asks to update tools.
+- Optional input: `confirmUpdate="CONFIRM_UPDATE"` required with `autoUpdate=true`.
+- Optional input: `updateScope="installed"|"all"` (default `installed`).
+- Optional input: `skipGitHubCheck=true` for offline mode (no remote freshness check).
 
 Trigger rules:
 
 - Normal mode (`force=false`): recommendation objectives must come from `userInput` with `/tool-reception ...`.
 - Automation mode (`force=true`): direct `objective` is accepted.
 - Install handoff mode (`autoInstall=true`): no installation runs automatically; tool only returns a command after explicit confirmation token.
+- Update mode (`update tools` objective):
+	- default: checks latest GitHub commit and returns planned update commands.
+	- execution: runs updates only when `autoUpdate=true` and `confirmUpdate="CONFIRM_UPDATE"`.
+
+Update intent example payload:
+
+```json
+{
+	"userInput": "/tool-reception update tools",
+	"autoUpdate": false,
+	"updateScope": "installed"
+}
+```
 
 Example payload:
 

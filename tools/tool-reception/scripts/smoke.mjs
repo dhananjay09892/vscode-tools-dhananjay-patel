@@ -110,6 +110,35 @@ async function run() {
     'autoInstall command should target the top recommendation tool'
   );
 
+  const updateCheck = await client.callTool({
+    name: 'tool_reception',
+    arguments: {
+      userInput: '/tool-reception update tools',
+      skipGitHubCheck: true,
+      updateScope: 'all'
+    }
+  });
+
+  const updateCheckText = updateCheck?.content?.[0]?.text ?? '';
+  assert(updateCheckText.includes('Update handoff: ready to execute'), 'update intent should generate update handoff');
+  assert(updateCheckText.includes('confirmationToken'), 'update intent JSON should include confirmation token');
+
+  const updateBlocked = await client.callTool({
+    name: 'tool_reception',
+    arguments: {
+      userInput: '/tool-reception update tools',
+      autoUpdate: true,
+      skipGitHubCheck: true,
+      updateScope: 'all'
+    }
+  });
+
+  const updateBlockedText = updateBlocked?.content?.[0]?.text ?? '';
+  assert(
+    updateBlockedText.includes('Update execution blocked'),
+    'autoUpdate should require explicit update confirmation token'
+  );
+
   await transport.close();
   console.log('Tool Reception smoke test passed.');
 }

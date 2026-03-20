@@ -10,7 +10,8 @@ const SERVER_VERSION = '0.0.1';
 
 type ToolArgs = Record<string, unknown>;
 type Severity = 'error' | 'warn' | 'info';
-type Mode = 'strict' | 'balanced' | 'legacy';
+type Mode = 'strict' | 'balanced' | 'legacy' | 'advisory';
+type SummaryMode = 'full' | 'executive';
 
 type JsonObject = Record<string, unknown>;
 
@@ -23,8 +24,44 @@ interface Finding {
   remediation: string;
 }
 
+interface SuppressionRule {
+  ruleId?: string;
+  category?: Finding['category'];
+  locationContains?: string;
+  messageContains?: string;
+  reason?: string;
+}
+
+interface SuppressedFinding {
+  finding: Finding;
+  rule: SuppressionRule;
+}
+
+interface RuleSummary {
+  ruleId: string;
+  severity: Severity;
+  category: Finding['category'];
+  count: number;
+  impactedEndpoints: number;
+  modules: { module: string; count: number }[];
+  quickFixTemplate?: string;
+}
+
+interface ModuleSummary {
+  module: string;
+  count: number;
+  rules: string[];
+}
+
+interface ExecutiveSummary {
+  topRisks: RuleSummary[];
+  impactedEndpointCount: number;
+  moduleCount: number;
+}
+
 interface GuardianReport {
   mode: Mode;
+  summaryMode: SummaryMode;
   candidatePath: string;
   baselinePath?: string;
   totals: {
@@ -34,7 +71,57 @@ interface GuardianReport {
   };
   blocking: boolean;
   findings: Finding[];
+  separation: {
+    breakingFindings: number;
+    policyFindings: number;
+  };
+  grouping: {
+    byRule: RuleSummary[];
+    byModule: ModuleSummary[];
+  };
+  executiveSummary: ExecutiveSummary;
+  suppressions?: {
+    sourcePath: string;
+    suppressedCount: number;
+    appliedRules: number;
+  };
 }
+
+const QUICK_FIX_TEMPLATES: Record<string, string> = {
+  'ER-002': [
+    'responses:',
+    "  '400':",
+    '    description: Bad Request',
+    '    content:',
+    "      application/problem+json:",
+    '        schema:',
+    "          $ref: '#/components/schemas/ProblemDetails'"
+  ].join('\n'),
+  'ER-003': [
+    'ProblemDetails:',
+    '  type: object',
+    '  required: [type, title, status]',
+    '  properties:',
+    '    type: { type: string, format: uri }',
+    '    title: { type: string }',
+    '    status: { type: integer }',
+    '    detail: { type: string }',
+    '    instance: { type: string }'
+  ].join('\n'),
+  'REL-003': [
+    'parameters:',
+    '  - name: page',
+    '    in: query',
+    '    schema: { type: integer, minimum: 1 }',
+    '  - name: limit',
+    '    in: query',
+    '    schema: { type: integer, minimum: 1, maximum: 100 }'
+  ].join('\n'),
+  'SEC-001': [
+    'security:',
+    '  - oauth2: [orders.read]'
+  ].join('\n')
+};
 
 interface OperationEntry {
   pathKey: string;
@@ -49,10 +136,18 @@ function asOptionalString(value: unknown): string | undefined {
 
 function asMode(value: unknown): Mode {
   const raw = asOptionalString(value)?.toLowerCase();
-  if (raw === 'strict' || raw === 'balanced' || raw === 'legacy') {
+  if (raw === 'strict' || raw === 'balanced' || raw === 'legacy' || raw === 'advisory') {
     return raw;
   }
   return 'balanced';
+}
+
+function asSummaryMode(value: unknown): SummaryMode {
+  const raw = asOptionalString(value)?.toLowerCase();
+  if (raw === 'executive') {
+    return 'executive';
+  }
+  return 'full';
 }
 
 function getWorkspaceRoot(): string {
@@ -80,6 +175,30 @@ async function readSpec(filePath: string): Promise<JsonObject> {
     return (parseYaml(content) ?? {}) as JsonObject;
   }
   return JSON.parse(content) as JsonObject;
+}
+
+async function readSuppressions(filePath: string): Promise<SuppressionRule[]> {
+  const content = await fs.readFile(filePath, 'utf-8');
+  const ext = path.extname(filePath).toLowerCase();
+  const raw = (ext === '.yaml' || ext === '.yml' ? parseYaml(content) : JSON.parse(content)) as unknown;
+
+  const root = asObject(raw);
+  const candidateList = Array.isArray(raw)
+    ? raw
+    : Array.isArray(root.suppressions)
+      ? root.suppressions
+      : [];
+
+  return candidateList.map((item) => {
+    const obj = asObject(item);
+    return {
+      ruleId: asOptionalString(obj.ruleId),
+      category: asOptionalString(obj.category) as Finding['category'] | undefined,
+      locationContains: asOptionalString(obj.locationContains),
+      messageContains: asOptionalString(obj.messageContains),
+      reason: asOptionalString(obj.reason)
+    } satisfies SuppressionRule;
+  });
 }
 
 function asObject(value: unknown): JsonObject {
@@ -227,6 +346,117 @@ function hasProblemRequiredFields(problemSchema: JsonObject): boolean {
 
 function pathMethodKey(pathKey: string, method: string): string {
   return `${method.toUpperCase()} ${pathKey}`;
+}
+
+function moduleFromLocation(location: string): string {
+  const parts = location.split(' ');
+  const maybePath = parts.length > 1 ? parts.slice(1).join(' ') : location;
+  if (maybePath.startsWith('/')) {
+    const first = maybePath.split('/').filter(Boolean)[0];
+    return first ?? 'root';
+  }
+  if (maybePath.startsWith('#/components')) {
+    return 'components';
+  }
+  return 'other';
+}
+
+function matchesSuppression(finding: Finding, rule: SuppressionRule): boolean {
+  if (rule.ruleId && rule.ruleId !== finding.ruleId) {
+    return false;
+  }
+  if (rule.category && rule.category !== finding.category) {
+    return false;
+  }
+  if (rule.locationContains && !finding.location.includes(rule.locationContains)) {
+    return false;
+  }
+  if (rule.messageContains && !finding.message.includes(rule.messageContains)) {
+    return false;
+  }
+  return true;
+}
+
+function applySuppressions(findings: Finding[], rules: SuppressionRule[]): { active: Finding[]; suppressed: SuppressedFinding[] } {
+  if (rules.length === 0) {
+    return { active: findings, suppressed: [] };
+  }
+
+  const active: Finding[] = [];
+  const suppressed: SuppressedFinding[] = [];
+  for (const finding of findings) {
+    const match = rules.find((rule) => matchesSuppression(finding, rule));
+    if (match) {
+      suppressed.push({ finding, rule: match });
+      continue;
+    }
+    active.push(finding);
+  }
+
+  return { active, suppressed };
+}
+
+function buildRuleSummary(findings: Finding[]): RuleSummary[] {
+  const grouped = new Map<string, { seed: Finding; findings: Finding[] }>();
+  for (const finding of findings) {
+    const entry = grouped.get(finding.ruleId);
+    if (entry) {
+      entry.findings.push(finding);
+      continue;
+    }
+    grouped.set(finding.ruleId, { seed: finding, findings: [finding] });
+  }
+
+  return [...grouped.entries()]
+    .map(([ruleId, entry]) => {
+      const moduleCounts = new Map<string, number>();
+      const endpoints = new Set(entry.findings.map((f) => f.location));
+      for (const f of entry.findings) {
+        const module = moduleFromLocation(f.location);
+        moduleCounts.set(module, (moduleCounts.get(module) ?? 0) + 1);
+      }
+
+      return {
+        ruleId,
+        severity: entry.seed.severity,
+        category: entry.seed.category,
+        count: entry.findings.length,
+        impactedEndpoints: endpoints.size,
+        modules: [...moduleCounts.entries()]
+          .map(([module, count]) => ({ module, count }))
+          .sort((a, b) => b.count - a.count),
+        quickFixTemplate: QUICK_FIX_TEMPLATES[ruleId]
+      } satisfies RuleSummary;
+    })
+    .sort((a, b) => b.count - a.count || a.ruleId.localeCompare(b.ruleId));
+}
+
+function buildModuleSummary(findings: Finding[]): ModuleSummary[] {
+  const grouped = new Map<string, { count: number; rules: Set<string> }>();
+  for (const finding of findings) {
+    const module = moduleFromLocation(finding.location);
+    const entry = grouped.get(module) ?? { count: 0, rules: new Set<string>() };
+    entry.count += 1;
+    entry.rules.add(finding.ruleId);
+    grouped.set(module, entry);
+  }
+
+  return [...grouped.entries()]
+    .map(([module, value]) => ({
+      module,
+      count: value.count,
+      rules: [...value.rules].sort()
+    }))
+    .sort((a, b) => b.count - a.count || a.module.localeCompare(b.module));
+}
+
+function buildExecutiveSummary(byRule: RuleSummary[], byModule: ModuleSummary[]): ExecutiveSummary {
+  const impactedEndpointCount = byRule.reduce((acc, rule) => acc + rule.impactedEndpoints, 0);
+  return {
+    topRisks: byRule.slice(0, 5),
+    impactedEndpointCount,
+    moduleCount: byModule.length
+  };
 }
 
 function enumValues(schema: JsonObject): string[] {
@@ -457,7 +687,16 @@ function compareBreaking(baseline: JsonObject, candidate: JsonObject, findings: 
   }
 }
 
-function evaluate(candidate: JsonObject, baseline: JsonObject | undefined, mode: Mode, candidatePath: string, baselinePath?: string): GuardianReport {
+function evaluate(
+  candidate: JsonObject,
+  baseline: JsonObject | undefined,
+  mode: Mode,
+  summaryMode: SummaryMode,
+  candidatePath: string,
+  baselinePath?: string,
+  suppressionSourcePath?: string,
+  suppressionRules: SuppressionRule[] = []
+): GuardianReport {
   const findings: Finding[] = [];
   const operations = getOperations(candidate);
 
@@ -571,13 +810,25 @@ function evaluate(candidate: JsonObject, baseline: JsonObject | undefined, mode:
     compareBreaking(baseline, candidate, findings);
   }
 
-  const totals = {
-    error: findings.filter((f) => f.severity === 'error').length,
-    warn: findings.filter((f) => f.severity === 'warn').length,
-    info: findings.filter((f) => f.severity === 'info').length
+  const suppressionResult = applySuppressions(findings, suppressionRules);
+  const activeFindings = suppressionResult.active;
+  const byRule = buildRuleSummary(activeFindings);
+  const byModule = buildModuleSummary(activeFindings);
+  const separation = {
+    breakingFindings: activeFindings.filter((f) => f.category === 'breaking').length,
+    policyFindings: activeFindings.filter((f) => f.category !== 'breaking').length
   };
 
-  const blocking = findings.some((f) => {
+  const totals = {
+    error: activeFindings.filter((f) => f.severity === 'error').length,
+    warn: activeFindings.filter((f) => f.severity === 'warn').length,
+    info: activeFindings.filter((f) => f.severity === 'info').length
+  };
+
+  const blocking = activeFindings.some((f) => {
+    if (mode === 'advisory') {
+      return false;
+    }
     if (mode === 'strict') {
       return f.severity === 'error';
     }
@@ -590,11 +841,25 @@ function evaluate(candidate: JsonObject, baseline: JsonObject | undefined, mode:
 
   return {
     mode,
+    summaryMode,
     candidatePath,
     baselinePath,
     totals,
     blocking,
-    findings
+    findings: activeFindings,
+    separation,
+    grouping: {
+      byRule,
+      byModule
+    },
+    executiveSummary: buildExecutiveSummary(byRule, byModule),
+    suppressions: suppressionSourcePath
+      ? {
+          sourcePath: suppressionSourcePath,
+          suppressedCount: suppressionResult.suppressed.length,
+          appliedRules: suppressionRules.length
+        }
+      : undefined
   };
 }
 
@@ -603,18 +868,85 @@ function renderMarkdown(report: GuardianReport): string {
   lines.push('# Backend API Contract Guardian Report');
   lines.push('');
   lines.push(`- Mode: ${report.mode}`);
+  lines.push(`- Summary mode: ${report.summaryMode}`);
   lines.push(`- Candidate: ${report.candidatePath}`);
   if (report.baselinePath) {
     lines.push(`- Baseline: ${report.baselinePath}`);
   }
   lines.push(`- Blocking: ${report.blocking}`);
   lines.push(`- Totals: error=${report.totals.error}, warn=${report.totals.warn}, info=${report.totals.info}`);
+  lines.push(`- Breaking findings: ${report.separation.breakingFindings}`);
+  lines.push(`- Policy/governance findings: ${report.separation.policyFindings}`);
+  if (report.suppressions) {
+    lines.push(`- Suppressed findings: ${report.suppressions.suppressedCount} (rules loaded: ${report.suppressions.appliedRules})`);
+    lines.push(`- Suppressions source: ${report.suppressions.sourcePath}`);
+  }
+  lines.push('');
+  lines.push('## Executive Summary');
+  lines.push('');
+  lines.push(`- Top risk rules shown: ${report.executiveSummary.topRisks.length}`);
+  lines.push(`- Estimated impacted endpoint count: ${report.executiveSummary.impactedEndpointCount}`);
+  lines.push(`- Impacted modules: ${report.executiveSummary.moduleCount}`);
+  lines.push('');
+  lines.push('| Rule | Severity | Category | Findings | Impacted Endpoints | Top Modules |');
+  lines.push('|---|---|---|---:|---:|---|');
+  for (const risk of report.executiveSummary.topRisks) {
+    const topModules = risk.modules.slice(0, 3).map((m) => `${m.module}(${m.count})`).join(', ');
+    lines.push(`| ${risk.ruleId} | ${risk.severity} | ${risk.category} | ${risk.count} | ${risk.impactedEndpoints} | ${topModules || '-'} |`);
+  }
+  lines.push('');
+  lines.push('## Findings Grouped by Rule');
+  lines.push('');
+  lines.push('| Rule | Severity | Category | Findings | Impacted Endpoints | Module Distribution |');
+  lines.push('|---|---|---|---:|---:|---|');
+  for (const rule of report.grouping.byRule) {
+    const modules = rule.modules.map((m) => `${m.module}(${m.count})`).join(', ');
+    lines.push(`| ${rule.ruleId} | ${rule.severity} | ${rule.category} | ${rule.count} | ${rule.impactedEndpoints} | ${modules || '-'} |`);
+  }
+
+  const quickFixRules = report.grouping.byRule.filter((r) => typeof r.quickFixTemplate === 'string' && r.quickFixTemplate.length > 0);
+  if (quickFixRules.length > 0) {
+    lines.push('');
+    lines.push('## Quick-Fix Templates');
+    lines.push('');
+    for (const rule of quickFixRules) {
+      lines.push(`### ${rule.ruleId}`);
+      lines.push('```yaml');
+      lines.push(rule.quickFixTemplate ?? '');
+      lines.push('```');
+      lines.push('');
+    }
+  }
+
+  lines.push('## Findings Grouped by Module');
+  lines.push('');
+  lines.push('| Module | Findings | Rules |');
+  lines.push('|---|---:|---|');
+  for (const module of report.grouping.byModule) {
+    lines.push(`| ${module.module} | ${module.count} | ${module.rules.join(', ')} |`);
+  }
+
+  const breakingFindings = report.findings.filter((f) => f.category === 'breaking');
+  const policyFindings = report.findings.filter((f) => f.category !== 'breaking');
+
+  lines.push('');
+  lines.push('## Breaking-Change Findings');
+  lines.push('');
+  lines.push('| Rule | Severity | Location | Message |');
+  lines.push('|---|---|---|---|');
+  for (const f of breakingFindings) {
+    lines.push(`| ${f.ruleId} | ${f.severity} | ${f.location.replace(/\|/g, '\\|')} | ${f.message.replace(/\|/g, '\\|')} |`);
+  }
+
+  lines.push('');
+  lines.push('## Policy/Governance Findings');
   lines.push('');
   lines.push('| Rule | Severity | Category | Location | Message |');
   lines.push('|---|---|---|---|---|');
-  for (const f of report.findings) {
+  for (const f of policyFindings) {
     lines.push(`| ${f.ruleId} | ${f.severity} | ${f.category} | ${f.location.replace(/\|/g, '\\|')} | ${f.message.replace(/\|/g, '\\|')} |`);
   }
+
   lines.push('');
   return `${lines.join('\n')}\n`;
 }
@@ -642,32 +974,63 @@ async function handleGuardian(args: ToolArgs) {
   }
 
   const mode = asMode(args.mode);
+  const summaryMode = asSummaryMode(args.summaryMode);
   const specPath = resolveInWorkspace(specPathArg);
   const baselinePathArg = asOptionalString(args.baselineSpecPath);
   const baselinePath = baselinePathArg ? resolveInWorkspace(baselinePathArg) : undefined;
+  const suppressionsPathArg = asOptionalString(args.suppressionsPath);
+  const suppressionsPath = suppressionsPathArg ? resolveInWorkspace(suppressionsPathArg) : undefined;
 
   const candidate = await readSpec(specPath);
   const baseline = baselinePath ? await readSpec(baselinePath) : undefined;
+  const suppressionRules = suppressionsPath ? await readSuppressions(suppressionsPath) : [];
 
-  const report = evaluate(candidate, baseline, mode, specPath, baselinePath);
+  const report = evaluate(
+    candidate,
+    baseline,
+    mode,
+    summaryMode,
+    specPath,
+    baselinePath,
+    suppressionsPath,
+    suppressionRules
+  );
   const outputDir = asOptionalString(args.outputDir);
   const writtenFiles = outputDir ? await writeReports(outputDir, report) : [];
 
   const lines: string[] = [];
   lines.push('Backend API Contract Guardian completed.');
   lines.push(`Mode: ${report.mode}`);
+  lines.push(`Summary mode: ${report.summaryMode}`);
   lines.push(`Blocking: ${report.blocking}`);
   lines.push(`Totals: error=${report.totals.error}, warn=${report.totals.warn}, info=${report.totals.info}`);
+  lines.push(`Breaking findings: ${report.separation.breakingFindings}`);
+  lines.push(`Policy/governance findings: ${report.separation.policyFindings}`);
   lines.push(`Findings: ${report.findings.length}`);
+  if (report.suppressions) {
+    lines.push(`Suppressed findings: ${report.suppressions.suppressedCount}`);
+  }
   if (writtenFiles.length > 0) {
     lines.push(`Reports written:\n- ${writtenFiles.join('\n- ')}`);
   }
+
+  const payload = summaryMode === 'executive'
+    ? {
+        mode: report.mode,
+        summaryMode: report.summaryMode,
+        blocking: report.blocking,
+        totals: report.totals,
+        separation: report.separation,
+        executiveSummary: report.executiveSummary,
+        suppressions: report.suppressions
+      }
+    : report;
 
   return {
     content: [
       {
         type: 'text',
-        text: `${lines.join('\n')}\n\n${JSON.stringify(report, null, 2)}`
+        text: `${lines.join('\n')}\n\n${JSON.stringify(payload, null, 2)}`
       }
     ]
   };
@@ -697,8 +1060,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             },
             mode: {
               type: 'string',
-              enum: ['strict', 'balanced', 'legacy'],
-              description: 'Policy mode. Default balanced.'
+              enum: ['strict', 'balanced', 'advisory', 'legacy'],
+              description: 'Severity profile preset. Default balanced.'
+            },
+            summaryMode: {
+              type: 'string',
+              enum: ['full', 'executive'],
+              description: 'Report verbosity. executive returns top risks and impacted counts.'
+            },
+            suppressionsPath: {
+              type: 'string',
+              description: 'Optional JSON/YAML file with suppression rules for phased adoption.'
             },
             outputDir: {
               type: 'string',
