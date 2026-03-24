@@ -1,6 +1,16 @@
 import * as vscode from 'vscode';
 
 export type DevpilotChatMode = 'chat' | 'agent' | 'plan';
+export type ToolApprovalScope = 'askEveryTime' | 'allowSession' | 'allowWorkspace';
+
+export interface ToolApprovalConfig {
+  defaultReadScope: ToolApprovalScope;
+  defaultWriteScope: ToolApprovalScope;
+  defaultExecuteScope: ToolApprovalScope;
+  defaultBrowserScope: ToolApprovalScope;
+  defaultNetworkScope: ToolApprovalScope;
+  workspaceAllowedTools: string[];
+}
 
 export interface ARIAConfig {
   provider: string;
@@ -19,9 +29,19 @@ export interface ARIAConfig {
   requestTimeoutMs: number;
   enableGuardrails: boolean;
   inlineLlmEnabled: boolean;
+  toolApproval: ToolApprovalConfig;
+  toolAuditMaxEntries: number;
 }
 
 const DEFAULT_TIMEOUT_MS = 20000;
+
+function normalizeToolApprovalScope(value: string): ToolApprovalScope {
+  if (value === 'allowSession' || value === 'allowWorkspace') {
+    return value;
+  }
+
+  return 'askEveryTime';
+}
 
 function normalizeChatMode(value: string): DevpilotChatMode {
   if (value === 'agent' || value === 'plan') {
@@ -39,7 +59,7 @@ export function getDevpilotConfig(): ARIAConfig {
   const inlineFastModelOverride = cfg.get<string>('inlineFastModelOverride', '').trim();
   const enabledTools = cfg.get<string[]>(
     'enabledTools',
-    ['create_directory', 'create_file', 'edit_file', 'write_file', 'replace_in_file', 'rename_file']
+    ['create_directory', 'create_file', 'edit_file', 'write_file', 'replace_in_file', 'rename_file', 'search_workspace']
   );
   const chatMode = normalizeChatMode(cfg.get<string>('chatMode', 'chat').trim().toLowerCase());
   const autoAttachCurrentFile = cfg.get<boolean>('autoAttachCurrentFile', true);
@@ -56,6 +76,16 @@ export function getDevpilotConfig(): ARIAConfig {
     : DEFAULT_TIMEOUT_MS;
   const enableGuardrails = cfg.get<boolean>('enableGuardrails', true);
   const inlineLlmEnabled = cfg.get<boolean>('inlineLlmEnabled', true);
+  const defaultReadScope = normalizeToolApprovalScope(cfg.get<string>('toolApproval.defaultReadScope', 'allowSession'));
+  const defaultWriteScope = normalizeToolApprovalScope(cfg.get<string>('toolApproval.defaultWriteScope', 'askEveryTime'));
+  const defaultExecuteScope = normalizeToolApprovalScope(cfg.get<string>('toolApproval.defaultExecuteScope', 'askEveryTime'));
+  const defaultBrowserScope = normalizeToolApprovalScope(cfg.get<string>('toolApproval.defaultBrowserScope', 'askEveryTime'));
+  const defaultNetworkScope = normalizeToolApprovalScope(cfg.get<string>('toolApproval.defaultNetworkScope', 'askEveryTime'));
+  const workspaceAllowedTools = cfg.get<string[]>('toolApproval.workspaceAllowedTools', []);
+  const toolAuditMaxEntriesRaw = cfg.get<number>('toolAudit.maxEntries', 200);
+  const toolAuditMaxEntries = Number.isFinite(toolAuditMaxEntriesRaw)
+    ? Math.max(50, Math.trunc(toolAuditMaxEntriesRaw))
+    : 200;
 
   return {
     provider,
@@ -73,7 +103,16 @@ export function getDevpilotConfig(): ARIAConfig {
     ollamaBaseUrl,
     requestTimeoutMs,
     enableGuardrails,
-    inlineLlmEnabled
+    inlineLlmEnabled,
+    toolApproval: {
+      defaultReadScope,
+      defaultWriteScope,
+      defaultExecuteScope,
+      defaultBrowserScope,
+      defaultNetworkScope,
+      workspaceAllowedTools
+    },
+    toolAuditMaxEntries
   };
 }
 

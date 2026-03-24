@@ -2,7 +2,7 @@
   "name": "devpilot-tool",
   "displayName": "Devpilot Tool",
   "description": "Repo-aware VS Code assistant for chat, analysis, refactoring suggestions, and inline productivity.",
-  "version": "0.1.25",
+  "version": "0.1.28",
   "publisher": "internal-tools",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -43,6 +43,8 @@
     "onCommand:devpilot.quickActions",
     "onCommand:devpilot.toggleInlineSuggestions",
     "onCommand:devpilot.openSettings",
+    "onCommand:devpilot.showToolAudit",
+    "onCommand:devpilot.searchSubagent",
     "onCommand:devpilot.configureTools",
     "onCommand:devpilot.attachFiles",
     "onView:devpilot.chatView",
@@ -88,6 +90,14 @@
       {
         "command": "devpilot.openSettings",
         "title": "Devpilot: Open Settings"
+      },
+      {
+        "command": "devpilot.showToolAudit",
+        "title": "Devpilot: Tool Audit Timeline"
+      },
+      {
+        "command": "devpilot.searchSubagent",
+        "title": "Devpilot: Search Subagent"
       },
       {
         "command": "devpilot.configureTools",
@@ -142,7 +152,8 @@
             "edit_file",
             "write_file",
             "replace_in_file",
-            "rename_file"
+            "rename_file",
+            "search_workspace"
           ],
           "description": "Enabled Devpilot agent tools for chat sessions. Use Devpilot: Configure Tools to manage this list."
         },
@@ -224,6 +235,70 @@
           "type": "boolean",
           "default": true,
           "description": "Use configured LLM for inline suggestions with context-window prompts; local fallback remains active."
+        },
+        "devpilot.toolApproval.defaultReadScope": {
+          "type": "string",
+          "default": "allowSession",
+          "enum": [
+            "askEveryTime",
+            "allowSession",
+            "allowWorkspace"
+          ],
+          "description": "Default approval scope for read-only tools."
+        },
+        "devpilot.toolApproval.defaultWriteScope": {
+          "type": "string",
+          "default": "askEveryTime",
+          "enum": [
+            "askEveryTime",
+            "allowSession",
+            "allowWorkspace"
+          ],
+          "description": "Default approval scope for file-write tools."
+        },
+        "devpilot.toolApproval.defaultExecuteScope": {
+          "type": "string",
+          "default": "askEveryTime",
+          "enum": [
+            "askEveryTime",
+            "allowSession",
+            "allowWorkspace"
+          ],
+          "description": "Default approval scope for terminal/execute tools."
+        },
+        "devpilot.toolApproval.defaultBrowserScope": {
+          "type": "string",
+          "default": "askEveryTime",
+          "enum": [
+            "askEveryTime",
+            "allowSession",
+            "allowWorkspace"
+          ],
+          "description": "Default approval scope for browser interaction tools."
+        },
+        "devpilot.toolApproval.defaultNetworkScope": {
+          "type": "string",
+          "default": "askEveryTime",
+          "enum": [
+            "askEveryTime",
+            "allowSession",
+            "allowWorkspace"
+          ],
+          "description": "Default approval scope for network or external fetch tools."
+        },
+        "devpilot.toolApproval.workspaceAllowedTools": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Tool IDs that are pre-approved for this workspace scope."
+        },
+        "devpilot.toolAudit.maxEntries": {
+          "type": "number",
+          "default": 200,
+          "minimum": 50,
+          "description": "Maximum in-memory audit records retained for tool execution history."
         }
       }
     }

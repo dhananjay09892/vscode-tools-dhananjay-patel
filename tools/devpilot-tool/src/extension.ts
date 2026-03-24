@@ -3,7 +3,7 @@ import * as path from 'node:path';
 import { ChatContextPayload, ChatRequestPayload, ChatResponsePayload, startChatBackend } from './chatBackend';
 import { collectChatContext } from './contextCollector';
 import { AttachedFileContext, InlineLlmSuggestionRequest, registerInlineCompletionProvider } from './inlineCompletion';
-import { DevpilotChatMode, getDevpilotConfig, resolveChatEndpoint } from './config';
+import { DevpilotChatMode, getDevpilotConfig, resolveChatEndpoint, ToolApprovalScope } from './config';
 import { sanitizeContext, sanitizePrompt } from './guardrails';
 import { createLogger } from './logger';
 import { buildQuickActionItems, toUserFriendlyError } from './commandUtils';
@@ -31,6 +31,8 @@ const COMMAND_QUICK_ACTIONS = 'devpilot.quickActions';
 const COMMAND_CONFIGURE_LLM = 'devpilot.configureLlm';
 const COMMAND_OPEN_SETTINGS = 'devpilot.openSettings';
 const COMMAND_CONFIGURE_TOOLS = 'devpilot.configureTools';
+const COMMAND_SHOW_TOOL_AUDIT = 'devpilot.showToolAudit';
+const COMMAND_SEARCH_SUBAGENT = 'devpilot.searchSubagent';
 const COMMAND_ATTACH_FILES = 'devpilot.attachFiles';
 const COMMAND_TOGGLE_INLINE = 'devpilot.toggleInlineSuggestions';
 const SECRET_API_KEY = 'devpilot.apiKey';
@@ -54,7 +56,8 @@ type AgentToolAction =
   | { type: 'screenshot_page' | 'screenshotPage'; pageId: string }
   | { type: 'type_in_page' | 'typeInPage'; pageId: string; text?: string; key?: string }
   | { type: 'hover_element' | 'hoverElement'; pageId: string; selector?: string }
-  | { type: 'run_playwright_code' | 'runPlaywrightCode'; pageId: string; code?: string };
+  | { type: 'run_playwright_code' | 'runPlaywrightCode'; pageId: string; code?: string }
+  | { type: 'search_workspace' | 'searchWorkspace'; query: string; includePattern?: string; maxResults?: number };
 
 interface AgentToolEnvelope {
   actions: AgentToolAction[];
@@ -63,8 +66,21 @@ interface AgentToolEnvelope {
 interface ConfigurableTool {
   id: string;
   category: string;
+  risk: 'read' | 'edit' | 'execute' | 'browser' | 'network';
+  mutating: boolean;
   label: string;
   description: string;
+}
+
+interface ToolExecutionAuditRecord {
+  ts: string;
+  toolId: string;
+  actionType: string;
+  approval: 'askEveryTime' | 'allowSession' | 'allowWorkspace' | 'blocked';
+  outcome: 'applied' | 'skipped' | 'failed';
+  durationMs: number;
+  details: string;
+  error?: string;
 }
 
 interface BrowserSession {
@@ -80,7 +96,15 @@ interface BrowserSession {
   page?: unknown;
 }
 
+interface WorkspaceSearchHit {
+  path: string;
+  line: number;
+  preview: string;
+}
+
 const BROWSER_SESSIONS = new Map<string, BrowserSession>();
+const SESSION_ALLOWED_TOOL_IDS = new Set<string>();
+const TOOL_EXECUTION_AUDIT: ToolExecutionAuditRecord[] = [];
 const WRITE_TOOL_IDS = new Set<string>([
   'create_directory',
   'create_file',
@@ -92,20 +116,21 @@ const WRITE_TOOL_IDS = new Set<string>([
 ]);
 
 const CONFIGURABLE_TOOLS: ConfigurableTool[] = [
-  { id: 'create_directory', category: 'Built-In', label: 'createDirectory', description: 'Create new directories in your workspace' },
-  { id: 'create_file', category: 'Built-In', label: 'createFile', description: 'Create new files in your workspace' },
-  { id: 'create_jupyter_notebook', category: 'Built-In', label: 'createJupyterNotebook', description: 'Create a new Jupyter notebook file' },
-  { id: 'edit_file', category: 'Built-In', label: 'editFiles', description: 'Edit files by replacing full file content' },
-  { id: 'write_file', category: 'Built-In', label: 'writeFile', description: 'Write full file content in your workspace' },
-  { id: 'replace_in_file', category: 'Built-In', label: 'editInline', description: 'Replace exact text in a file in your workspace' },
-  { id: 'rename_file', category: 'Built-In', label: 'rename', description: 'Rename or move a file within your workspace' },
-  { id: 'open_browser_page', category: 'Browser', label: 'openBrowserPage', description: 'Open a URL in the browser and create a page session' },
-  { id: 'navigate_page', category: 'Browser', label: 'navigatePage', description: 'Navigate or reload a tracked page session' },
-  { id: 'read_page', category: 'Browser', label: 'readPage', description: 'Fetch readable text content for a tracked page session' },
-  { id: 'screenshot_page', category: 'Browser', label: 'screenshotPage', description: 'Capture page screenshot (Playwright runtime when available)' },
-  { id: 'type_in_page', category: 'Browser', label: 'typeInPage', description: 'Type text or key into a page selector/focused element' },
-  { id: 'hover_element', category: 'Browser', label: 'hoverElement', description: 'Hover over a selector on page' },
-  { id: 'run_playwright_code', category: 'Browser', label: 'runPlaywrightCode', description: 'Execute advanced browser code in Playwright runtime' }
+  { id: 'create_directory', category: 'Built-In', risk: 'edit', mutating: true, label: 'createDirectory', description: 'Create new directories in your workspace' },
+  { id: 'create_file', category: 'Built-In', risk: 'edit', mutating: true, label: 'createFile', description: 'Create new files in your workspace' },
+  { id: 'create_jupyter_notebook', category: 'Built-In', risk: 'edit', mutating: true, label: 'createJupyterNotebook', description: 'Create a new Jupyter notebook file' },
+  { id: 'edit_file', category: 'Built-In', risk: 'edit', mutating: true, label: 'editFiles', description: 'Edit files by replacing full file content' },
+  { id: 'write_file', category: 'Built-In', risk: 'edit', mutating: true, label: 'writeFile', description: 'Write full file content in your workspace' },
+  { id: 'replace_in_file', category: 'Built-In', risk: 'edit', mutating: true, label: 'editInline', description: 'Replace exact text in a file in your workspace' },
+  { id: 'rename_file', category: 'Built-In', risk: 'edit', mutating: true, label: 'rename', description: 'Rename or move a file within your workspace' },
+  { id: 'open_browser_page', category: 'Browser', risk: 'browser', mutating: false, label: 'openBrowserPage', description: 'Open a URL in the browser and create a page session' },
+  { id: 'navigate_page', category: 'Browser', risk: 'browser', mutating: false, label: 'navigatePage', description: 'Navigate or reload a tracked page session' },
+  { id: 'read_page', category: 'Browser', risk: 'read', mutating: false, label: 'readPage', description: 'Fetch readable text content for a tracked page session' },
+  { id: 'screenshot_page', category: 'Browser', risk: 'browser', mutating: false, label: 'screenshotPage', description: 'Capture page screenshot (Playwright runtime when available)' },
+  { id: 'type_in_page', category: 'Browser', risk: 'browser', mutating: true, label: 'typeInPage', description: 'Type text or key into a page selector/focused element' },
+  { id: 'hover_element', category: 'Browser', risk: 'browser', mutating: false, label: 'hoverElement', description: 'Hover over a selector on page' },
+  { id: 'run_playwright_code', category: 'Browser', risk: 'browser', mutating: true, label: 'runPlaywrightCode', description: 'Execute advanced browser code in Playwright runtime' },
+  { id: 'search_workspace', category: 'Built-In', risk: 'read', mutating: false, label: 'searchWorkspace', description: 'Search workspace text and return matching snippets' }
 ];
 
 export function activate(context: vscode.ExtensionContext): void {
@@ -241,7 +266,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
           let toolExecutionSummary = '';
           if (mode === 'agent') {
-            const execution = await maybeRunAgentTools(response.answer, config.agentAllowFileWrites, config.enabledTools);
+            const execution = await maybeRunAgentTools(response.answer, config, logger);
             if (execution.executedCount > 0 || execution.skippedReason) {
               toolExecutionSummary = [
                 '',
@@ -338,6 +363,14 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const configureTools = vscode.commands.registerCommand(COMMAND_CONFIGURE_TOOLS, async () => {
     await runConfigureToolsCommand(logger);
+  });
+
+  const showToolAudit = vscode.commands.registerCommand(COMMAND_SHOW_TOOL_AUDIT, async () => {
+    await runShowToolAuditCommand(output, logger);
+  });
+
+  const searchSubagent = vscode.commands.registerCommand(COMMAND_SEARCH_SUBAGENT, async () => {
+    await runSearchSubagentCommand(output, logger, statusBar);
   });
 
   const attachFiles = vscode.commands.registerCommand(COMMAND_ATTACH_FILES, async () => {
@@ -457,6 +490,8 @@ export function activate(context: vscode.ExtensionContext): void {
     sidebarChatProvider,
     quickActions,
     openSettings,
+    showToolAudit,
+    searchSubagent,
     configureTools,
     attachFiles,
     toggleInlineSuggestions,
@@ -522,6 +557,172 @@ async function runDeveloperCommand(
     vscode.window.showErrorMessage(
       `Devpilot: ${title} failed. ${toUserFriendlyError(messageText, { providerId: getCurrentProviderId(getDevpilotConfig().provider) })}`
     );
+  }
+}
+
+async function runShowToolAuditCommand(
+  output: vscode.OutputChannel,
+  logger: ReturnType<typeof createLogger>
+): Promise<void> {
+  if (TOOL_EXECUTION_AUDIT.length === 0) {
+    vscode.window.showInformationMessage('Devpilot tool audit is empty for this session.');
+    return;
+  }
+
+  const choice = await vscode.window.showQuickPick(
+    [
+      { label: 'View Recent Entries', value: 'view' },
+      { label: 'Export JSON', value: 'export' }
+    ],
+    { placeHolder: 'Select Tool Audit action' }
+  );
+
+  if (!choice) {
+    return;
+  }
+
+  if (choice.value === 'view') {
+    const lines = TOOL_EXECUTION_AUDIT
+      .slice(-50)
+      .map((entry) => {
+        return [
+          `[${entry.ts}] ${entry.outcome.toUpperCase()} ${entry.toolId}`,
+          ` approval=${entry.approval} duration=${entry.durationMs}ms`,
+          ` details=${entry.details}`,
+          entry.error ? ` error=${entry.error}` : ''
+        ]
+          .filter((line) => line.length > 0)
+          .join('\n');
+      })
+      .join('\n\n');
+
+    output.clear();
+    output.appendLine('=== Devpilot Tool Audit Timeline ===');
+    output.appendLine(lines);
+    output.show(true);
+    return;
+  }
+
+  const exportedPath = await exportToolAuditJson();
+  logger.info('tools.audit_exported', { path: exportedPath, records: TOOL_EXECUTION_AUDIT.length });
+  vscode.window.showInformationMessage(`Devpilot tool audit exported: ${exportedPath}`);
+}
+
+async function exportToolAuditJson(): Promise<string> {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders || folders.length === 0) {
+    throw new Error('No workspace folder available for exporting tool audit.');
+  }
+
+  const baseDir = path.resolve(folders[0].uri.fsPath, '.devpilot', 'tool-audit');
+  const fileName = `tool-audit-${Date.now()}.json`;
+  const targetPath = path.resolve(baseDir, fileName);
+
+  await vscode.workspace.fs.createDirectory(vscode.Uri.file(baseDir));
+  await vscode.workspace.fs.writeFile(
+    vscode.Uri.file(targetPath),
+    Buffer.from(JSON.stringify(TOOL_EXECUTION_AUDIT, null, 2), 'utf-8')
+  );
+
+  return targetPath;
+}
+
+async function runSearchSubagentCommand(
+  output: vscode.OutputChannel,
+  logger: ReturnType<typeof createLogger>,
+  statusBar: vscode.StatusBarItem
+): Promise<void> {
+  const query = (await vscode.window.showInputBox({
+    prompt: 'Search Subagent query',
+    placeHolder: 'Example: tool approval defaultReadScope',
+    validateInput: (value) => (value.trim().length === 0 ? 'Query is required.' : undefined)
+  }))?.trim();
+
+  if (!query) {
+    return;
+  }
+
+  const scopeChoice = await vscode.window.showQuickPick(
+    [
+      { label: 'All workspace files', value: 'all' as const },
+      { label: 'Active file only', value: 'active' as const },
+      { label: 'Custom glob pattern', value: 'custom' as const }
+    ],
+    { placeHolder: 'Choose search scope' }
+  );
+
+  if (!scopeChoice) {
+    return;
+  }
+
+  let includePattern: string | undefined;
+  if (scopeChoice.value === 'active') {
+    const activePath = vscode.window.activeTextEditor?.document?.fileName;
+    if (!activePath) {
+      vscode.window.showWarningMessage('Devpilot: no active editor. Falling back to all workspace files.');
+    } else {
+      includePattern = vscode.workspace.asRelativePath(activePath, false).replace(/\\/g, '/');
+    }
+  }
+
+  if (scopeChoice.value === 'custom') {
+    includePattern = normalizeIncludePattern(
+      await vscode.window.showInputBox({
+        prompt: 'Enter include glob pattern (workspace-relative)',
+        placeHolder: 'Example: src/** or **/*.ts',
+        validateInput: (value) => (value.trim().length === 0 ? 'Glob pattern is required.' : undefined)
+      })
+    );
+
+    if (!includePattern) {
+      return;
+    }
+  }
+
+  const maxResultsPick = await vscode.window.showQuickPick(
+    [
+      { label: '10 results', value: '10' },
+      { label: '25 results', value: '25' },
+      { label: '50 results', value: '50' }
+    ],
+    { placeHolder: 'Max results' }
+  );
+
+  if (!maxResultsPick) {
+    return;
+  }
+
+  const maxResults = Number.parseInt(maxResultsPick.value, 10);
+  setStatusBar(statusBar, 'working');
+
+  try {
+    const hits = await searchWorkspaceSnippets(query, includePattern, maxResults);
+    output.clear();
+    output.appendLine('=== Devpilot Search Subagent ===');
+    output.appendLine(`query: ${query}`);
+    output.appendLine(`include: ${includePattern ?? '(all files)'}`);
+    output.appendLine(`hits: ${hits.length}`);
+    output.appendLine('');
+
+    if (hits.length === 0) {
+      output.appendLine('No matches found.');
+    } else {
+      for (const hit of hits) {
+        output.appendLine(`${hit.path}:${hit.line} | ${hit.preview}`);
+      }
+    }
+
+    output.show(true);
+    logger.info('subagent.search.completed', { query, includePattern: includePattern ?? '(all)', maxResults, hits: hits.length });
+    setStatusBar(statusBar, 'ready');
+    vscode.window.showInformationMessage(`Devpilot Search Subagent: found ${hits.length} match(es).`);
+  } catch (error) {
+    const messageText = toErrorMessage(error);
+    logger.error('subagent.search.failed', { query, includePattern: includePattern ?? '(all)', reason: messageText });
+    output.appendLine(`[devpilot] Search Subagent failed: ${messageText}`);
+    output.show(true);
+    setStatusBar(statusBar, 'error');
+    vscode.window.showErrorMessage(`Devpilot Search Subagent failed: ${messageText}`);
   }
 }
 
@@ -1065,13 +1266,22 @@ function normalizeChatMode(value?: string): DevpilotChatMode {
 }
 
 function applyModeToPrompt(prompt: string, mode: DevpilotChatMode): string {
+  const workspaceGrounding = [
+    'Devpilot workspace context is already provided in this request.',
+    'You can rely on active-file context, selection, diagnostics, git summary, and attached file excerpts included by the extension.',
+    'Do not claim you cannot access the filesystem or project context.',
+    'If additional context is needed, ask for one specific file or ask the user to use "Attach Files" in Devpilot.',
+    'When asked how to attach project context, explain Devpilot-native steps: use Attach Files button, keep Auto-attach current file enabled, and use Search Subagent for discovery.'
+  ].join(' ');
+
   if (mode === 'agent') {
     return [
       'Mode: agent',
+      workspaceGrounding,
       'Be action-oriented. Propose executable steps, commands, and implementation details grounded in workspace context.',
       'When file edits are required, append a tool envelope at the end using this exact format:',
       '<devpilot-tools>{"actions":[{"type":"write_file","path":"relative/path.ext","content":"full file content"}]}</devpilot-tools>',
-      'Supported actions: create_directory, create_file, create_jupyter_notebook, edit_file, write_file, replace_in_file, rename_file.',
+      'Supported actions: create_directory, create_file, create_jupyter_notebook, edit_file, write_file, replace_in_file, rename_file, search_workspace, open_browser_page, navigate_page, read_page, screenshot_page, type_in_page, hover_element, run_playwright_code.',
       'Use workspace-relative paths only and include valid JSON without markdown fences inside the envelope.',
       prompt
     ].join('\n\n');
@@ -1080,6 +1290,7 @@ function applyModeToPrompt(prompt: string, mode: DevpilotChatMode): string {
   if (mode === 'plan') {
     return [
       'Mode: plan',
+      workspaceGrounding,
       'Respond with a clear step-by-step plan first, including assumptions, risks, and validation checkpoints before deep implementation details.',
       prompt
     ].join('\n\n');
@@ -1087,7 +1298,8 @@ function applyModeToPrompt(prompt: string, mode: DevpilotChatMode): string {
 
   return [
     'Mode: chat',
-    'Give a direct and concise assistant response tailored to the request.',
+    workspaceGrounding,
+    'Give a direct and concise assistant response tailored to the request. Prefer concrete next actions over generic capability descriptions.',
     prompt
   ].join('\n\n');
 }
@@ -1118,15 +1330,15 @@ async function getActiveEditorAttachment(existingPaths: string[]): Promise<Attac
 
 async function maybeRunAgentTools(
   answer: string,
-  allowFileWrites: boolean,
-  enabledTools: string[]
+  config: ReturnType<typeof getDevpilotConfig>,
+  logger: ReturnType<typeof createLogger>
 ): Promise<{ executedCount: number; executed: string[]; skippedReason?: string }> {
   const envelope = parseAgentToolEnvelope(answer);
   if (!envelope || envelope.actions.length === 0) {
     return { executedCount: 0, executed: [] };
   }
 
-  const enabledSet = new Set(enabledTools);
+  const enabledSet = new Set(config.enabledTools);
   const actions = envelope.actions.filter((action) => enabledSet.has(normalizeAgentToolType(action.type)));
   if (actions.length === 0) {
     return {
@@ -1137,7 +1349,7 @@ async function maybeRunAgentTools(
   }
 
   const hasWriteAction = actions.some((action) => WRITE_TOOL_IDS.has(normalizeAgentToolType(action.type)));
-  if (!allowFileWrites && hasWriteAction) {
+  if (!config.agentAllowFileWrites && hasWriteAction) {
     return {
       executedCount: 0,
       executed: [],
@@ -1145,28 +1357,189 @@ async function maybeRunAgentTools(
     };
   }
 
-  const approval = await vscode.window.showWarningMessage(
-    `Devpilot agent requested ${actions.length} tool action(s). Apply changes?`,
+  const executed: string[] = [];
+  let skippedReason: string | undefined;
+
+  for (const action of actions) {
+    const toolId = normalizeAgentToolType(action.type);
+    const configuredTool = CONFIGURABLE_TOOLS.find((tool) => tool.id === toolId);
+    const risk = configuredTool?.risk ?? 'execute';
+    const approvalScope = getDefaultScopeForRisk(risk, config);
+
+    const approval = await resolveToolApproval(toolId, approvalScope, config.toolApproval.workspaceAllowedTools);
+    if (!approval.allowed) {
+      const details = summarizeActionDetails(action);
+      appendToolAudit(
+        {
+          ts: new Date().toISOString(),
+          toolId,
+          actionType: action.type,
+          approval: 'blocked',
+          outcome: 'skipped',
+          durationMs: 0,
+          details,
+          error: 'approval denied'
+        },
+        config.toolAuditMaxEntries,
+        logger
+      );
+      skippedReason = `approval denied for ${toolId}`;
+      continue;
+    }
+
+    const startedAt = Date.now();
+    const details = summarizeActionDetails(action);
+    try {
+      const executionLabel = await runAgentToolAction(action);
+      executed.push(executionLabel);
+      appendToolAudit(
+        {
+          ts: new Date().toISOString(),
+          toolId,
+          actionType: action.type,
+          approval: approval.scope,
+          outcome: 'applied',
+          durationMs: Date.now() - startedAt,
+          details
+        },
+        config.toolAuditMaxEntries,
+        logger
+      );
+    } catch (error) {
+      appendToolAudit(
+        {
+          ts: new Date().toISOString(),
+          toolId,
+          actionType: action.type,
+          approval: approval.scope,
+          outcome: 'failed',
+          durationMs: Date.now() - startedAt,
+          details,
+          error: toErrorMessage(error)
+        },
+        config.toolAuditMaxEntries,
+        logger
+      );
+      throw error;
+    }
+  }
+
+  return { executedCount: executed.length, executed, skippedReason };
+}
+
+function getDefaultScopeForRisk(
+  risk: ConfigurableTool['risk'],
+  config: ReturnType<typeof getDevpilotConfig>
+): ToolApprovalScope {
+  if (risk === 'read') {
+    return config.toolApproval.defaultReadScope;
+  }
+
+  if (risk === 'edit') {
+    return config.toolApproval.defaultWriteScope;
+  }
+
+  if (risk === 'browser') {
+    return config.toolApproval.defaultBrowserScope;
+  }
+
+  if (risk === 'network') {
+    return config.toolApproval.defaultNetworkScope;
+  }
+
+  return config.toolApproval.defaultExecuteScope;
+}
+
+async function resolveToolApproval(
+  toolId: string,
+  scope: ToolApprovalScope,
+  workspaceAllowedTools: string[]
+): Promise<{ allowed: boolean; scope: ToolExecutionAuditRecord['approval'] }> {
+  if (workspaceAllowedTools.includes(toolId)) {
+    return { allowed: true, scope: 'allowWorkspace' };
+  }
+
+  if (SESSION_ALLOWED_TOOL_IDS.has(toolId)) {
+    return { allowed: true, scope: 'allowSession' };
+  }
+
+  if (scope === 'allowWorkspace') {
+    return { allowed: true, scope: 'allowWorkspace' };
+  }
+
+  if (scope === 'allowSession') {
+    return { allowed: true, scope: 'allowSession' };
+  }
+
+  const choice = await vscode.window.showWarningMessage(
+    `Devpilot agent requested tool: ${toolId}`,
     { modal: true },
-    'Apply',
+    'Allow Once',
+    'Allow for Session',
+    'Allow for Workspace',
     'Cancel'
   );
 
-  if (approval !== 'Apply') {
-    return {
-      executedCount: 0,
-      executed: [],
-      skippedReason: 'user cancelled tool execution'
-    };
+  if (choice === 'Allow for Session') {
+    SESSION_ALLOWED_TOOL_IDS.add(toolId);
+    return { allowed: true, scope: 'allowSession' };
   }
 
-  const executed: string[] = [];
-  for (const action of actions) {
-    const executionLabel = await runAgentToolAction(action);
-    executed.push(executionLabel);
+  if (choice === 'Allow for Workspace') {
+    const cfg = vscode.workspace.getConfiguration('devpilot');
+    const current = new Set(cfg.get<string[]>('toolApproval.workspaceAllowedTools', []));
+    current.add(toolId);
+    await cfg.update('toolApproval.workspaceAllowedTools', [...current].sort((a, b) => a.localeCompare(b)), vscode.ConfigurationTarget.Workspace);
+    return { allowed: true, scope: 'allowWorkspace' };
   }
 
-  return { executedCount: executed.length, executed };
+  if (choice === 'Allow Once') {
+    return { allowed: true, scope: 'askEveryTime' };
+  }
+
+  return { allowed: false, scope: 'blocked' };
+}
+
+function summarizeActionDetails(action: AgentToolAction): string {
+  const toolId = normalizeAgentToolType(action.type);
+  if ('query' in action && typeof action.query === 'string') {
+    return `${toolId}:query=${action.query.slice(0, 120)}`;
+  }
+
+  if ('path' in action && typeof action.path === 'string') {
+    return `${toolId}:path=${action.path}`;
+  }
+
+  if ('pageId' in action && typeof action.pageId === 'string') {
+    return `${toolId}:pageId=${action.pageId}`;
+  }
+
+  if ('url' in action && typeof action.url === 'string') {
+    return `${toolId}:url=${action.url}`;
+  }
+
+  return toolId;
+}
+
+function appendToolAudit(
+  record: ToolExecutionAuditRecord,
+  maxEntries: number,
+  logger: ReturnType<typeof createLogger>
+): void {
+  TOOL_EXECUTION_AUDIT.push(record);
+  if (TOOL_EXECUTION_AUDIT.length > maxEntries) {
+    TOOL_EXECUTION_AUDIT.splice(0, TOOL_EXECUTION_AUDIT.length - maxEntries);
+  }
+
+  logger.info('tools.audit', {
+    toolId: record.toolId,
+    actionType: record.actionType,
+    approval: record.approval,
+    outcome: record.outcome,
+    durationMs: record.durationMs,
+    details: record.details,
+    error: record.error
+  });
 }
 
 function parseAgentToolEnvelope(answer: string): AgentToolEnvelope | undefined {
@@ -1362,6 +1735,14 @@ async function runAgentToolAction(action: AgentToolAction): Promise<string> {
     return `${toolType}:${pageId}:recorded`;
   }
 
+  if (toolType === 'search_workspace') {
+    const query = getActionQuery(action);
+    const includePattern = normalizeIncludePattern(getActionIncludePattern(action));
+    const maxResults = getActionMaxResults(action);
+    const hits = await searchWorkspaceSnippets(query, includePattern, maxResults);
+    return `${toolType}:${hits.length}hits:query=${query.slice(0, 60)}`;
+  }
+
   if (toolType === 'create_directory') {
     const dirPath = getActionPath(action);
     const dirUri = await resolveWorkspaceFileUri(dirPath);
@@ -1517,7 +1898,76 @@ function normalizeAgentToolType(type: string): string {
     return 'run_playwright_code';
   }
 
+  if (type === 'searchWorkspace') {
+    return 'search_workspace';
+  }
+
   return type;
+}
+
+async function searchWorkspaceSnippets(
+  query: string,
+  includePattern: string | undefined,
+  maxResults: number
+): Promise<WorkspaceSearchHit[]> {
+  const hits: WorkspaceSearchHit[] = [];
+
+  const includeGlob = includePattern && includePattern.length > 0 ? includePattern : '**/*';
+  const excludeGlob = '{**/node_modules/**,**/.git/**,**/dist/**,**/out/**,**/build/**,**/coverage/**}';
+  const safeMaxResults = Math.max(1, Math.min(200, maxResults));
+  const files = await vscode.workspace.findFiles(includeGlob, excludeGlob, 400);
+  const normalizedQuery = query.toLowerCase();
+
+  for (const file of files) {
+    if (hits.length >= safeMaxResults) {
+      break;
+    }
+
+    let content: string;
+    try {
+      const bytes = await vscode.workspace.fs.readFile(file);
+      if (bytes.length > 1_000_000) {
+        continue;
+      }
+
+      content = Buffer.from(bytes).toString('utf-8');
+    } catch {
+      continue;
+    }
+
+    const lines = content.split(/\r?\n/);
+    for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+      if (hits.length >= safeMaxResults) {
+        break;
+      }
+
+      const lineText = lines[lineIndex];
+      if (!lineText.toLowerCase().includes(normalizedQuery)) {
+        continue;
+      }
+
+      hits.push({
+        path: vscode.workspace.asRelativePath(file, false).replace(/\\/g, '/'),
+        line: lineIndex + 1,
+        preview: lineText.replace(/\s+/g, ' ').trim()
+      });
+    }
+  }
+
+  return hits;
+}
+
+function normalizeIncludePattern(value: string | undefined): string | undefined {
+  if (!value) {
+    return undefined;
+  }
+
+  const trimmed = value.trim();
+  if (!trimmed) {
+    return undefined;
+  }
+
+  return trimmed.replace(/\\/g, '/');
 }
 
 function normalizePathInput(value: string): string {
@@ -1795,6 +2245,30 @@ function getActionCode(action: AgentToolAction): string {
   }
 
   return '';
+}
+
+function getActionQuery(action: AgentToolAction): string {
+  if ('query' in action && typeof action.query === 'string' && action.query.trim().length > 0) {
+    return action.query.trim();
+  }
+
+  throw new Error(`Tool action ${action.type} is missing required field: query`);
+}
+
+function getActionIncludePattern(action: AgentToolAction): string | undefined {
+  if ('includePattern' in action && typeof action.includePattern === 'string') {
+    return action.includePattern;
+  }
+
+  return undefined;
+}
+
+function getActionMaxResults(action: AgentToolAction): number {
+  if ('maxResults' in action && typeof action.maxResults === 'number' && Number.isFinite(action.maxResults)) {
+    return Math.max(1, Math.min(200, Math.trunc(action.maxResults)));
+  }
+
+  return 25;
 }
 
 function getActionUrl(action: AgentToolAction): string {
@@ -2346,7 +2820,7 @@ function getWebviewHtml(): string {
     </div>
   </div>
   <div id="messages" class="messages">
-    <div class="msg">Ask a question to start. I can use active-file context and attached files.</div>
+    <div class="msg">Ask a question to start. I can use active-file context and attached files. Use Attach Files for extra docs and keep Auto-attach current file on for fast results.</div>
   </div>
   <div class="composer">
     <textarea id="prompt" placeholder="Describe what to build"></textarea>

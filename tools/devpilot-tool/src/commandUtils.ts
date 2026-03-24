@@ -11,6 +11,8 @@ export function buildQuickActionItems(): QuickActionItem[] {
   return [
     { label: 'Open Chat', command: 'devpilot.openChat' },
     { label: 'Open Settings', command: 'devpilot.openSettings' },
+    { label: 'Tool Audit Timeline', command: 'devpilot.showToolAudit' },
+    { label: 'Search Subagent', command: 'devpilot.searchSubagent' },
     { label: 'Configure Tools', command: 'devpilot.configureTools' },
     { label: 'Toggle Inline Suggestions', command: 'devpilot.toggleInlineSuggestions' },
     { label: 'Configure LLM', command: 'devpilot.configureLlm' },

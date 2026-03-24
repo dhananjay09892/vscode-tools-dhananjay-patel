@@ -106,6 +106,27 @@ function containsDuplicate(nums) {
   return false;
 }
 
+// LeetCode #3: Longest Substring Without Repeating Characters
+// Returns the length of the longest substring without repeating characters.
+function lengthOfLongestSubstring(s) {
+  let left = 0;
+  let maxLen = 0;
+  const lastSeen = new Map(); // char -> most recent index
+
+  for (let right = 0; right < s.length; right++) {
+    const ch = s[right];
+
+    if (lastSeen.has(ch) && lastSeen.get(ch) >= left) {
+      left = lastSeen.get(ch) + 1;
+    }
+
+    lastSeen.set(ch, right);
+    maxLen = Math.max(maxLen, right - left + 1);
+  }
+
+  return maxLen;
+}
+
 // Example usage:
 console.log(isAnagram('anagram', 'nagaram')); // true
 console.log(isAnagram('rat', 'car')); // false
@@ -125,6 +146,6 @@ console.log(isPalindrome('race a car')); // false
 console.log(containsDuplicate([1, 2, 3, 1])); // true
 console.log(containsDuplicate([1, 2, 3, 4])); // false
 
-// lets add another leetcode program
-// Leetcode #3: Longest Substring Without Repeating Characters
-// function 
+console.log(lengthOfLongestSubstring('abcabcbb')); // 3
+console.log(lengthOfLongestSubstring('bbbbb')); // 1
+console.log(lengthOfLongestSubstring('pwwkew')); // 3

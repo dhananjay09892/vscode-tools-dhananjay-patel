@@ -63,6 +63,7 @@ OtherData/
 # tools/devpilot-tool
 Devpilot/
 tools/github.copilot-chat-0.40.1
+tools/devpilot-tool/*.vsix
 tools/devpilot-tool/devpilot-tool-0.1.0.vsix
 tools/devpilot-tool/devpilot-tool-0.1.1.vsix
 tools/devpilot-tool/devpilot-tool-0.1.2.vsix
@@ -90,3 +91,5 @@ tools/devpilot-tool/devpilot-tool-0.1.23.vsix
 tools/devpilot-tool/devpilot-tool-0.1.24.vsix
 
 tools/devpilot-tool/IMPLEMENTATION_TRACKER.md
+PROJECT_DOCUMENTATION.md
+test-marketing.md
