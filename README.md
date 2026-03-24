@@ -20,6 +20,7 @@ We truly love and respect the software developer community, and this project is 
 - `tools/scrape-markdown-tool`
 - `tools/scrape-pipeline-tool`
 - `tools/backend-api-contract-guardian`
+- `tools/devpilot-tool`
 
 ## Suggested Build Order
 
@@ -187,6 +188,7 @@ Current supported ToolId values:
 - scrape-markdown-tool
 - scrape-pipeline-tool
 - backend-api-contract-guardian
+- devpilot-tool
 
 After running, verify output includes: `public-install.ps1 version: 2026-03-17.1`
 

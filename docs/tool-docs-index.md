@@ -111,7 +111,7 @@ Rules:
   "useCases": [
     "convert scraped data to markdown",
     "build indexed knowledge packs",
-    "prepare docs for copilot consumption"
+    "prepare docs for devpilot consumption"
   ],
   "keywords": [
     "markdown",
