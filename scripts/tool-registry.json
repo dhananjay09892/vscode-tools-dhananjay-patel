@@ -56,13 +56,6 @@
       "kind": "mcp-server",
       "installCommand": "install",
       "buildCommand": "build"
-    },
-    "devpilot-tool": {
-      "sourceSubPath": "tools/devpilot-tool",
-      "installSubPath": ".copilot-tools/devpilot-tool",
-      "kind": "vscode-extension",
-      "installCommand": "install",
-      "buildCommand": "compile"
     }
   }
 }
