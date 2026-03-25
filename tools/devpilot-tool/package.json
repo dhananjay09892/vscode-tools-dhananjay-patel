@@ -2,7 +2,7 @@
   "name": "devpilot-tool",
   "displayName": "Devpilot Tool",
   "description": "Repo-aware VS Code assistant for chat, analysis, refactoring suggestions, and inline productivity.",
-  "version": "0.1.28",
+  "version": "0.1.53",
   "publisher": "internal-tools",
   "license": "MIT",
   "icon": "resources/icon.png",
@@ -45,14 +45,18 @@
     "onCommand:devpilot.openSettings",
     "onCommand:devpilot.showToolAudit",
     "onCommand:devpilot.searchSubagent",
+    "onCommand:devpilot.agentSwarm",
     "onCommand:devpilot.configureTools",
+    "onCommand:devpilot.manageAgentPermissions",
     "onCommand:devpilot.attachFiles",
+    "onCommand:devpilot.showFirstFixGhost",
     "onView:devpilot.chatView",
     "onCommand:devpilot.configureLlm",
     "onCommand:devpilot.analyzeCurrentFile",
     "onCommand:devpilot.explainSelection",
     "onCommand:devpilot.generateTests",
-    "onCommand:devpilot.refactorSuggestion"
+    "onCommand:devpilot.refactorSuggestion",
+    "onCommand:devpilot.reconAndPlan"
   ],
   "main": "./out/extension.js",
   "contributes": {
@@ -100,8 +104,16 @@
         "title": "Devpilot: Search Subagent"
       },
       {
+        "command": "devpilot.agentSwarm",
+        "title": "Devpilot: Agent Swarm"
+      },
+      {
         "command": "devpilot.configureTools",
         "title": "Devpilot: Configure Tools"
+      },
+      {
+        "command": "devpilot.manageAgentPermissions",
+        "title": "Devpilot: Manage Agent Permissions"
       },
       {
         "command": "devpilot.attachFiles",
@@ -126,6 +138,26 @@
       {
         "command": "devpilot.refactorSuggestion",
         "title": "Devpilot: Refactor Suggestion"
+      },
+      {
+        "command": "devpilot.reconAndPlan",
+        "title": "Devpilot: Recon and Plan"
+      },
+      {
+        "command": "devpilot.showFirstFixGhost",
+        "title": "Devpilot: Show First Fix Suggestion (Ghost)"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "editor.action.inlineSuggest.commit",
+        "key": "tab",
+        "when": "inlineSuggestionVisible && editorTextFocus && !editorReadonly"
+      },
+      {
+        "command": "devpilot.showFirstFixGhost",
+        "key": "ctrl+alt+f",
+        "when": "editorTextFocus && !editorReadonly"
       }
     ],
     "configuration": {
@@ -235,6 +267,85 @@
           "type": "boolean",
           "default": true,
           "description": "Use configured LLM for inline suggestions with context-window prompts; local fallback remains active."
+        },
+        "devpilot.quickFixEnabled": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable Devpilot Quick Fix code actions. Keep disabled to prioritize ghost inline suggestions only."
+        },
+        "devpilot.inlineDiagnosticFixMode": {
+          "type": "string",
+          "default": "always",
+          "enum": [
+            "errorOnly",
+            "errorAndWarning",
+            "always"
+          ],
+          "description": "When to show diagnostic-based inline fix suggestions: only for errors, for errors and warnings, or always when a fix can be computed on the current line."
+        },
+        "devpilot.inlineContextMode": {
+          "type": "string",
+          "default": "fullFileWhenSmall",
+          "enum": [
+            "window",
+            "fullFileWhenSmall"
+          ],
+          "description": "Inline context strategy: small cursor window for speed or full file when file size is within limit."
+        },
+        "devpilot.inlineMaxFileChars": {
+          "type": "number",
+          "default": 18000,
+          "minimum": 4000,
+          "maximum": 120000,
+          "description": "Maximum characters allowed when using full-file inline context mode."
+        },
+        "devpilot.inlineIncludeImportedFiles": {
+          "type": "boolean",
+          "default": true,
+          "description": "Include local imported files as extra inline context attachments when available."
+        },
+        "devpilot.inlineImportedFilesLimit": {
+          "type": "number",
+          "default": 2,
+          "minimum": 0,
+          "maximum": 6,
+          "description": "Maximum number of local imported files to include in inline context."
+        },
+        "devpilot.agentToolWorkspaceAllowed": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Agent-specific workspace approvals in the format <agentId>:<toolId> for Agent Swarm tool execution."
+        },
+        "devpilot.inlineDebounceMs": {
+          "type": "number",
+          "default": 90,
+          "minimum": 20,
+          "maximum": 500,
+          "description": "Debounce window in milliseconds before triggering inline suggestion requests. Lower values feel more immediate but can increase request volume."
+        },
+        "devpilot.inlineLlmBudgetMs": {
+          "type": "number",
+          "default": 1200,
+          "minimum": 300,
+          "maximum": 5000,
+          "description": "Maximum time budget for LLM inline suggestion generation before falling back to local suggestions."
+        },
+        "devpilot.inlineCacheTtlMs": {
+          "type": "number",
+          "default": 15000,
+          "minimum": 1000,
+          "maximum": 120000,
+          "description": "How long inline LLM suggestions remain cached for matching prefix/context requests."
+        },
+        "devpilot.inlineCacheMaxEntries": {
+          "type": "number",
+          "default": 200,
+          "minimum": 20,
+          "maximum": 1000,
+          "description": "Maximum number of cached inline LLM suggestions retained in memory."
         },
         "devpilot.toolApproval.defaultReadScope": {
           "type": "string",

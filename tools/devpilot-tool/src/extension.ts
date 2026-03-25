@@ -2,11 +2,14 @@ import * as vscode from 'vscode';
 import * as path from 'node:path';
 import { ChatContextPayload, ChatRequestPayload, ChatResponsePayload, startChatBackend } from './chatBackend';
 import { collectChatContext } from './contextCollector';
-import { AttachedFileContext, InlineLlmSuggestionRequest, registerInlineCompletionProvider } from './inlineCompletion';
+import { computeDiagnosticLineFixes, registerDiagnosticQuickFixProvider } from './diagnosticFixes';
+import { AttachedFileContext, forceNextDiagnosticGhostForDocument, InlineLlmSuggestionRequest, registerInlineCompletionProvider } from './inlineCompletion';
 import { DevpilotChatMode, getDevpilotConfig, resolveChatEndpoint, ToolApprovalScope } from './config';
 import { sanitizeContext, sanitizePrompt } from './guardrails';
 import { createLogger } from './logger';
 import { buildQuickActionItems, toUserFriendlyError } from './commandUtils';
+import { ActionPlan, buildActionPlan, buildReconReport, PlanOpportunity, ReconMode, ReconReport, renderPlanMarkdown } from './reconPlanner';
+import { ALL_DEVPILOT_AGENTS, DevpilotAgentProfile } from './agentCatalog';
 import {
   createProviderClient,
   getProviderDescriptor,
@@ -27,14 +30,22 @@ const COMMAND_ANALYZE = 'devpilot.analyzeCurrentFile';
 const COMMAND_EXPLAIN = 'devpilot.explainSelection';
 const COMMAND_TESTS = 'devpilot.generateTests';
 const COMMAND_REFACTOR = 'devpilot.refactorSuggestion';
+const COMMAND_RECON_AND_PLAN = 'devpilot.reconAndPlan';
 const COMMAND_QUICK_ACTIONS = 'devpilot.quickActions';
 const COMMAND_CONFIGURE_LLM = 'devpilot.configureLlm';
 const COMMAND_OPEN_SETTINGS = 'devpilot.openSettings';
 const COMMAND_CONFIGURE_TOOLS = 'devpilot.configureTools';
+const COMMAND_MANAGE_AGENT_PERMISSIONS = 'devpilot.manageAgentPermissions';
 const COMMAND_SHOW_TOOL_AUDIT = 'devpilot.showToolAudit';
 const COMMAND_SEARCH_SUBAGENT = 'devpilot.searchSubagent';
+const COMMAND_AGENT_SWARM = 'devpilot.agentSwarm';
 const COMMAND_ATTACH_FILES = 'devpilot.attachFiles';
 const COMMAND_TOGGLE_INLINE = 'devpilot.toggleInlineSuggestions';
+const COMMAND_SHOW_FIRST_FIX_GHOST = 'devpilot.showFirstFixGhost';
+const TOOL_AUDIT_PANEL_ID = 'devpilot.toolAuditPanel';
+const TOOL_AUDIT_PANEL_TITLE = 'Devpilot Tool Audit Timeline';
+const AGENT_PERMISSIONS_PANEL_ID = 'devpilot.agentPermissionsPanel';
+const AGENT_PERMISSIONS_PANEL_TITLE = 'Devpilot Agent Permissions';
 const SECRET_API_KEY = 'devpilot.apiKey';
 const SECRET_SESSION_TOKEN = 'devpilot.sessionToken';
 const SECRET_OPENAI_API_KEY = 'devpilot.provider.openai.apiKey';
@@ -63,6 +74,12 @@ interface AgentToolEnvelope {
   actions: AgentToolAction[];
 }
 
+interface InteractiveQuestionEnvelope {
+  kind: 'yes_no' | 'single_select';
+  question: string;
+  options?: string[];
+}
+
 interface ConfigurableTool {
   id: string;
   category: string;
@@ -73,6 +90,7 @@ interface ConfigurableTool {
 }
 
 interface ToolExecutionAuditRecord {
+  id?: number;
   ts: string;
   toolId: string;
   actionType: string;
@@ -81,6 +99,7 @@ interface ToolExecutionAuditRecord {
   durationMs: number;
   details: string;
   error?: string;
+  replayAction?: AgentToolAction;
 }
 
 interface BrowserSession {
@@ -102,9 +121,21 @@ interface WorkspaceSearchHit {
   preview: string;
 }
 
+interface AgentSwarmRun {
+  round: number;
+  agent: DevpilotAgentProfile;
+  response: ChatResponsePayload;
+  text: string;
+  toolExecutionSummary?: string;
+}
+
 const BROWSER_SESSIONS = new Map<string, BrowserSession>();
 const SESSION_ALLOWED_TOOL_IDS = new Set<string>();
+const SESSION_ALLOWED_AGENT_TOOL_KEYS = new Set<string>();
 const TOOL_EXECUTION_AUDIT: ToolExecutionAuditRecord[] = [];
+let TOOL_AUDIT_SEQ = 0;
+let TOOL_AUDIT_PANEL: vscode.WebviewPanel | undefined;
+let AGENT_PERMISSIONS_PANEL: vscode.WebviewPanel | undefined;
 const WRITE_TOOL_IDS = new Set<string>([
   'create_directory',
   'create_file',
@@ -262,7 +293,44 @@ export function activate(context: vscode.ExtensionContext): void {
             context: contextPayload
           };
 
-          const response = await requestChatAnswer(config, payload, backendReady, context.secrets);
+          let response = await requestChatAnswer(config, payload, backendReady, context.secrets);
+          const visibleSegments: string[] = [];
+          let followUpCount = 0;
+
+          while (followUpCount < 3) {
+            const question = parseInteractiveQuestionEnvelope(response.answer);
+            const visibleAnswer = stripInteractiveQuestionEnvelope(response.answer);
+            if (visibleAnswer.length > 0) {
+              visibleSegments.push(visibleAnswer);
+            }
+
+            if (!question) {
+              break;
+            }
+
+            const choice = await askInteractiveQuestion(question);
+            if (!choice) {
+              visibleSegments.push('Interactive step cancelled by user.');
+              break;
+            }
+
+            const followUpPrompt = [
+              'Continue from the previous response with this confirmed user input.',
+              `Question: ${question.question}`,
+              `Answer: ${choice}`,
+              'Do not ask the same question again. Continue with the next best concrete step.'
+            ].join('\n');
+
+            const followUpPayload: ChatRequestPayload = {
+              prompt: enrichPromptWithAttachments(applyModeToPrompt(followUpPrompt, mode), finalAttachments),
+              context: contextPayload
+            };
+
+            response = await requestChatAnswer(config, followUpPayload, backendReady, context.secrets);
+            followUpCount += 1;
+          }
+
+          const finalAnswerText = visibleSegments.join('\n\n').trim() || response.answer;
 
           let toolExecutionSummary = '';
           if (mode === 'agent') {
@@ -278,7 +346,7 @@ export function activate(context: vscode.ExtensionContext): void {
             }
           }
 
-          webview.postMessage({ type: 'answer', text: `${response.answer}${toolExecutionSummary}` });
+          webview.postMessage({ type: 'answer', text: `${finalAnswerText}${toolExecutionSummary}` });
           logger.info('chat.request_succeeded', {
             requestId: response.requestId,
             model: config.model,
@@ -365,12 +433,20 @@ export function activate(context: vscode.ExtensionContext): void {
     await runConfigureToolsCommand(logger);
   });
 
+  const manageAgentPermissions = vscode.commands.registerCommand(COMMAND_MANAGE_AGENT_PERMISSIONS, async () => {
+    await runManageAgentPermissionsCommand(context, logger);
+  });
+
   const showToolAudit = vscode.commands.registerCommand(COMMAND_SHOW_TOOL_AUDIT, async () => {
-    await runShowToolAuditCommand(output, logger);
+    await runShowToolAuditCommand(context, output, logger);
   });
 
   const searchSubagent = vscode.commands.registerCommand(COMMAND_SEARCH_SUBAGENT, async () => {
     await runSearchSubagentCommand(output, logger, statusBar);
+  });
+
+  const agentSwarm = vscode.commands.registerCommand(COMMAND_AGENT_SWARM, async () => {
+    await runAgentSwarmCommand(backendReady, context.secrets, output, logger, statusBar);
   });
 
   const attachFiles = vscode.commands.registerCommand(COMMAND_ATTACH_FILES, async () => {
@@ -389,6 +465,10 @@ export function activate(context: vscode.ExtensionContext): void {
     setStatusBar(statusBar, 'ready');
     const stateLabel = next ? 'ON' : 'OFF';
     vscode.window.showInformationMessage(`Devpilot inline suggestions: ${stateLabel}`);
+  });
+
+  const showFirstFixGhost = vscode.commands.registerCommand(COMMAND_SHOW_FIRST_FIX_GHOST, async () => {
+    await runShowFirstFixGhostCommand(statusBar);
   });
 
   const analyzeCurrentFile = vscode.commands.registerCommand(COMMAND_ANALYZE, async () => {
@@ -443,9 +523,14 @@ export function activate(context: vscode.ExtensionContext): void {
     );
   });
 
+  const reconAndPlan = vscode.commands.registerCommand(COMMAND_RECON_AND_PLAN, async () => {
+    await runReconAndPlanCommand(output, logger, statusBar);
+  });
+
   const configWatcher = vscode.workspace.onDidChangeConfiguration((event) => {
     if (
       event.affectsConfiguration('devpilot.inlineLlmEnabled') ||
+      event.affectsConfiguration('devpilot.inlineDiagnosticFixMode') ||
       event.affectsConfiguration('devpilot.inlineFastModelOverride') ||
       event.affectsConfiguration('devpilot.provider') ||
       event.affectsConfiguration('devpilot.chatMode') ||
@@ -470,20 +555,35 @@ export function activate(context: vscode.ExtensionContext): void {
         return undefined;
       }
 
-      const linePrefix = request.linePrefix.trim();
-      if (linePrefix.length < 3) {
+      const linePrefix = request.linePrefix;
+      const nonWhitespacePrefixLength = linePrefix.replace(/\s+/g, '').length;
+      if (nonWhitespacePrefixLength > 0 && nonWhitespacePrefixLength < 2) {
         return undefined;
       }
 
       try {
-        const payload = buildInlineSuggestionPayload(request, config.enableGuardrails);
+        const payload = await buildInlineSuggestionPayload(request, config);
         return await requestInlineSuggestionAnswer(config, payload, backendReady, context.secrets, token);
       } catch {
         return undefined;
       }
     },
-    () => getDevpilotConfig().inlineLlmEnabled
+    () => getDevpilotConfig().inlineLlmEnabled,
+    () => {
+      const config = getDevpilotConfig();
+      return {
+        debounceMs: config.inlineDebounceMs,
+        llmBudgetMs: config.inlineLlmBudgetMs,
+        cacheTtlMs: config.inlineCacheTtlMs,
+        cacheMaxEntries: config.inlineCacheMaxEntries
+      };
+    },
+    () => getDevpilotConfig().inlineDiagnosticFixMode
   );
+
+  if (getDevpilotConfig().quickFixEnabled) {
+    registerDiagnosticQuickFixProvider(context);
+  }
 
   context.subscriptions.push(
     openChat,
@@ -492,18 +592,71 @@ export function activate(context: vscode.ExtensionContext): void {
     openSettings,
     showToolAudit,
     searchSubagent,
+    agentSwarm,
     configureTools,
+    manageAgentPermissions,
     attachFiles,
     toggleInlineSuggestions,
+    showFirstFixGhost,
     configureLlm,
     analyzeCurrentFile,
     explainSelection,
     generateTests,
     refactorSuggestion,
+    reconAndPlan,
     configWatcher,
     output,
     statusBar
   );
+}
+
+async function runShowFirstFixGhostCommand(statusBar: vscode.StatusBarItem): Promise<void> {
+  const editor = vscode.window.activeTextEditor;
+  if (!editor) {
+    vscode.window.showInformationMessage('Devpilot: Open a file to preview fix suggestion ghost text.');
+    return;
+  }
+
+  const targetLine = findFirstFixLine(editor.document);
+  if (targetLine === undefined) {
+    vscode.window.showInformationMessage('Devpilot: No fixable line found for ghost suggestion in this file.');
+    return;
+  }
+
+  const line = editor.document.lineAt(targetLine);
+  const cursor = line.range.end;
+  editor.selection = new vscode.Selection(cursor, cursor);
+  editor.revealRange(new vscode.Range(cursor, cursor), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+
+  forceNextDiagnosticGhostForDocument(editor.document.uri);
+  await vscode.commands.executeCommand('editor.action.inlineSuggest.trigger');
+  statusBar.text = '$(sparkle) Devpilot: Fix Suggestion';
+  statusBar.tooltip = 'Press Tab to accept fix ghost or Esc to dismiss.';
+}
+
+function findFirstFixLine(document: vscode.TextDocument): number | undefined {
+  const diagnostics = vscode.languages
+    .getDiagnostics(document.uri)
+    .filter((item) => item.severity === vscode.DiagnosticSeverity.Error || item.severity === vscode.DiagnosticSeverity.Warning)
+    .sort((a, b) => a.range.start.line - b.range.start.line);
+
+  for (const diag of diagnostics) {
+    const line = diag.range.start.line;
+    if (computeDiagnosticLineFixes(document, line).length > 0) {
+      return line;
+    }
+  }
+
+  // Fallback for files with no diagnostics: only consider explicit structural fixes, not indentation hints.
+  for (let line = 0; line < document.lineCount; line += 1) {
+    const hasStructuralFix = computeDiagnosticLineFixes(document, line)
+      .some((fix) => fix.title.includes('Fix merged keywords'));
+    if (hasStructuralFix) {
+      return line;
+    }
+  }
+
+  return undefined;
 }
 
 async function runDeveloperCommand(
@@ -561,51 +714,168 @@ async function runDeveloperCommand(
 }
 
 async function runShowToolAuditCommand(
+  context: vscode.ExtensionContext,
   output: vscode.OutputChannel,
   logger: ReturnType<typeof createLogger>
 ): Promise<void> {
-  if (TOOL_EXECUTION_AUDIT.length === 0) {
-    vscode.window.showInformationMessage('Devpilot tool audit is empty for this session.');
+  if (TOOL_AUDIT_PANEL) {
+    TOOL_AUDIT_PANEL.reveal(vscode.ViewColumn.Beside, true);
+    publishToolAuditState(TOOL_AUDIT_PANEL.webview);
     return;
   }
 
-  const choice = await vscode.window.showQuickPick(
-    [
-      { label: 'View Recent Entries', value: 'view' },
-      { label: 'Export JSON', value: 'export' }
-    ],
-    { placeHolder: 'Select Tool Audit action' }
+  TOOL_AUDIT_PANEL = vscode.window.createWebviewPanel(
+    TOOL_AUDIT_PANEL_ID,
+    TOOL_AUDIT_PANEL_TITLE,
+    vscode.ViewColumn.Beside,
+    { enableScripts: true, retainContextWhenHidden: true }
   );
 
-  if (!choice) {
+  TOOL_AUDIT_PANEL.webview.html = getToolAuditWebviewHtml();
+
+  TOOL_AUDIT_PANEL.onDidDispose(() => {
+    TOOL_AUDIT_PANEL = undefined;
+  }, undefined, context.subscriptions);
+
+  TOOL_AUDIT_PANEL.webview.onDidReceiveMessage(async (message: { type?: string; id?: number }) => {
+    if (!message?.type) {
+      return;
+    }
+
+    if (message.type === 'ready' || message.type === 'refresh') {
+      publishToolAuditState(TOOL_AUDIT_PANEL?.webview);
+      return;
+    }
+
+    if (message.type === 'export') {
+      try {
+        const exportedPath = await exportToolAuditJson();
+        logger.info('tools.audit_exported', { path: exportedPath, records: TOOL_EXECUTION_AUDIT.length });
+        vscode.window.showInformationMessage(`Devpilot tool audit exported: ${exportedPath}`);
+        publishToolAuditState(TOOL_AUDIT_PANEL?.webview, `Exported JSON to ${exportedPath}`);
+      } catch (error) {
+        publishToolAuditState(TOOL_AUDIT_PANEL?.webview, `Export failed: ${toErrorMessage(error)}`);
+      }
+      return;
+    }
+
+    if (message.type === 'clear') {
+      TOOL_EXECUTION_AUDIT.splice(0, TOOL_EXECUTION_AUDIT.length);
+      output.clear();
+      output.appendLine('=== Devpilot Tool Audit Timeline ===');
+      output.appendLine('Audit records cleared by user action.');
+      output.show(true);
+      logger.info('tools.audit_cleared', {});
+      publishToolAuditState(TOOL_AUDIT_PANEL?.webview, 'Audit records cleared.');
+      return;
+    }
+
+    if (message.type === 'copyAction') {
+      const record = findToolAuditRecordById(message.id);
+      if (!record?.replayAction) {
+        publishToolAuditState(TOOL_AUDIT_PANEL?.webview, 'No replay action payload available for this record.');
+        return;
+      }
+
+      await vscode.env.clipboard.writeText(JSON.stringify(record.replayAction, null, 2));
+      publishToolAuditState(TOOL_AUDIT_PANEL?.webview, 'Copied replay action JSON to clipboard.');
+      return;
+    }
+
+    if (message.type === 'rerunAction') {
+      const record = findToolAuditRecordById(message.id);
+      if (!record?.replayAction) {
+        publishToolAuditState(TOOL_AUDIT_PANEL?.webview, 'No replay action payload available for this record.');
+        return;
+      }
+
+      const toolId = normalizeAgentToolType(record.replayAction.type);
+      if (!isReplaySafeToolId(toolId)) {
+        publishToolAuditState(TOOL_AUDIT_PANEL?.webview, `Replay blocked for mutating tool: ${toolId}`);
+        return;
+      }
+
+      const startedAt = Date.now();
+      const details = `[rerun] ${summarizeActionDetails(record.replayAction)}`;
+      const cfg = getDevpilotConfig();
+
+      try {
+        const executionLabel = await runAgentToolAction(record.replayAction);
+        appendToolAudit(
+          {
+            ts: new Date().toISOString(),
+            toolId,
+            actionType: record.replayAction.type,
+            approval: 'askEveryTime',
+            outcome: 'applied',
+            durationMs: Date.now() - startedAt,
+            details: `${details} => ${executionLabel}`,
+            replayAction: record.replayAction
+          },
+          cfg.toolAuditMaxEntries,
+          logger
+        );
+        publishToolAuditState(TOOL_AUDIT_PANEL?.webview, `Reran ${toolId} successfully.`);
+      } catch (error) {
+        appendToolAudit(
+          {
+            ts: new Date().toISOString(),
+            toolId,
+            actionType: record.replayAction.type,
+            approval: 'askEveryTime',
+            outcome: 'failed',
+            durationMs: Date.now() - startedAt,
+            details,
+            error: toErrorMessage(error),
+            replayAction: record.replayAction
+          },
+          cfg.toolAuditMaxEntries,
+          logger
+        );
+        publishToolAuditState(TOOL_AUDIT_PANEL?.webview, `Rerun failed: ${toErrorMessage(error)}`);
+      }
+    }
+  }, undefined, context.subscriptions);
+
+  publishToolAuditState(TOOL_AUDIT_PANEL.webview);
+}
+
+function publishToolAuditState(webview: vscode.Webview | undefined, toast?: string): void {
+  if (!webview) {
     return;
   }
 
-  if (choice.value === 'view') {
-    const lines = TOOL_EXECUTION_AUDIT
-      .slice(-50)
-      .map((entry) => {
-        return [
-          `[${entry.ts}] ${entry.outcome.toUpperCase()} ${entry.toolId}`,
-          ` approval=${entry.approval} duration=${entry.durationMs}ms`,
-          ` details=${entry.details}`,
-          entry.error ? ` error=${entry.error}` : ''
-        ]
-          .filter((line) => line.length > 0)
-          .join('\n');
-      })
-      .join('\n\n');
+  const last50 = TOOL_EXECUTION_AUDIT.slice(-50).map((entry) => ({
+    ...entry,
+    canReplay: Boolean(entry.replayAction) && isReplaySafeToolId(entry.toolId),
+    hasReplayAction: Boolean(entry.replayAction)
+  }));
+  const summary = {
+    total: TOOL_EXECUTION_AUDIT.length,
+    applied: TOOL_EXECUTION_AUDIT.filter((entry) => entry.outcome === 'applied').length,
+    failed: TOOL_EXECUTION_AUDIT.filter((entry) => entry.outcome === 'failed').length,
+    skipped: TOOL_EXECUTION_AUDIT.filter((entry) => entry.outcome === 'skipped').length
+  };
 
-    output.clear();
-    output.appendLine('=== Devpilot Tool Audit Timeline ===');
-    output.appendLine(lines);
-    output.show(true);
-    return;
+  webview.postMessage({
+    type: 'auditState',
+    entries: last50,
+    summary,
+    toast
+  });
+}
+
+function findToolAuditRecordById(id: number | undefined): ToolExecutionAuditRecord | undefined {
+  if (!Number.isFinite(id)) {
+    return undefined;
   }
 
-  const exportedPath = await exportToolAuditJson();
-  logger.info('tools.audit_exported', { path: exportedPath, records: TOOL_EXECUTION_AUDIT.length });
-  vscode.window.showInformationMessage(`Devpilot tool audit exported: ${exportedPath}`);
+  return TOOL_EXECUTION_AUDIT.find((entry) => entry.id === id);
+}
+
+function isReplaySafeToolId(toolId: string): boolean {
+  const configured = CONFIGURABLE_TOOLS.find((entry) => entry.id === toolId);
+  return Boolean(configured && !configured.mutating);
 }
 
 async function exportToolAuditJson(): Promise<string> {
@@ -723,6 +993,777 @@ async function runSearchSubagentCommand(
     output.show(true);
     setStatusBar(statusBar, 'error');
     vscode.window.showErrorMessage(`Devpilot Search Subagent failed: ${messageText}`);
+  }
+}
+
+function parseInteractiveQuestionEnvelope(answer: string): InteractiveQuestionEnvelope | undefined {
+  const match = answer.match(/<devpilot-question>\s*([\s\S]*?)\s*<\/devpilot-question>/i);
+  if (!match || !match[1]) {
+    return undefined;
+  }
+
+  try {
+    const parsed = JSON.parse(match[1]) as InteractiveQuestionEnvelope;
+    if (!parsed || typeof parsed.question !== 'string') {
+      return undefined;
+    }
+
+    if (parsed.kind !== 'yes_no' && parsed.kind !== 'single_select') {
+      return undefined;
+    }
+
+    if (parsed.kind === 'single_select') {
+      if (!Array.isArray(parsed.options) || parsed.options.length < 2) {
+        return undefined;
+      }
+    }
+
+    return parsed;
+  } catch {
+    return undefined;
+  }
+}
+
+function stripInteractiveQuestionEnvelope(answer: string): string {
+  return answer.replace(/\s*<devpilot-question>[\s\S]*?<\/devpilot-question>\s*/gi, '').trim();
+}
+
+async function askInteractiveQuestion(question: InteractiveQuestionEnvelope): Promise<string | undefined> {
+  if (question.kind === 'yes_no') {
+    const pick = await vscode.window.showQuickPick(
+      [
+        { label: 'Yes', value: 'yes' },
+        { label: 'No', value: 'no' }
+      ],
+      {
+        placeHolder: question.question,
+        ignoreFocusOut: true
+      }
+    );
+
+    return pick?.value;
+  }
+
+  const picks = (question.options ?? []).map((item) => ({
+    label: item,
+    value: item
+  }));
+
+  const pick = await vscode.window.showQuickPick(picks, {
+    placeHolder: question.question,
+    ignoreFocusOut: true
+  });
+  return pick?.value;
+}
+
+async function runAgentSwarmCommand(
+  backendReady: Promise<Awaited<ReturnType<typeof startChatBackend>>>,
+  secrets: vscode.SecretStorage,
+  output: vscode.OutputChannel,
+  logger: ReturnType<typeof createLogger>,
+  statusBar: vscode.StatusBarItem
+): Promise<void> {
+  const selectedAgents = await vscode.window.showQuickPick(
+    ALL_DEVPILOT_AGENTS.map((agent) => ({
+      label: agent.id,
+      description: `${agent.group} - ${agent.title}`,
+      detail: agent.purpose,
+      agent
+    })),
+    {
+      canPickMany: true,
+      placeHolder: 'Select one or more specialist agents'
+    }
+  );
+
+  if (!selectedAgents || selectedAgents.length === 0) {
+    return;
+  }
+
+  const roundsPick = await vscode.window.showQuickPick(
+    [
+      { label: '1 Round (independent specialist pass)', value: 1 },
+      { label: '2 Rounds (review and refine)', value: 2 },
+      { label: '3 Rounds (deeper collaboration)', value: 3 }
+    ],
+    { placeHolder: 'Choose collaboration rounds' }
+  );
+
+  if (!roundsPick) {
+    return;
+  }
+
+  const toolExecutionPick = await vscode.window.showQuickPick(
+    [
+      { label: 'No tool execution (analysis only)', value: 'off' as const },
+      { label: 'Allow tool execution per agent approval', value: 'on' as const }
+    ],
+    { placeHolder: 'Should specialist agents be allowed to execute tools?' }
+  );
+
+  if (!toolExecutionPick) {
+    return;
+  }
+
+  const task = (await vscode.window.showInputBox({
+    prompt: 'Describe the outcome you want from the selected agents',
+    placeHolder: 'Example: Improve model-evaluation experiment design and rollout plan',
+    validateInput: (value) => (value.trim().length === 0 ? 'Task is required.' : undefined)
+  }))?.trim();
+
+  if (!task) {
+    return;
+  }
+
+  setStatusBar(statusBar, 'working');
+  try {
+    const config = getDevpilotConfig();
+    const contextRaw = await collectChatContext();
+    const contextPayload = config.enableGuardrails ? sanitizeContext(contextRaw) : contextRaw;
+    const runs: AgentSwarmRun[] = [];
+    const latestByAgent = new Map<string, string>();
+    const totalRounds = roundsPick.value;
+    const allowToolExecution = toolExecutionPick.value === 'on';
+
+    await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Devpilot Agent Swarm (${selectedAgents.length} agents x ${totalRounds} rounds)`,
+        cancellable: false
+      },
+      async (progress) => {
+        const totalSteps = selectedAgents.length * totalRounds;
+        const perStepIncrement = Math.max(2, Math.floor(75 / Math.max(1, totalSteps)));
+
+        for (let round = 1; round <= totalRounds; round += 1) {
+          for (const pick of selectedAgents) {
+            const agent = pick.agent;
+            progress.report({ message: `Round ${round}/${totalRounds}: ${agent.id}`, increment: perStepIncrement });
+
+            const peerContext = [...latestByAgent.entries()]
+              .filter(([agentId]) => agentId !== agent.id)
+              .map(([agentId, text]) => `${agentId}: ${text.slice(0, 1200)}`)
+              .join('\n\n');
+
+            const specialistPrompt = [
+              `You are specialist agent: ${agent.id}`,
+              `Group: ${agent.group}`,
+              `Purpose: ${agent.purpose}`,
+              `Responsibilities: ${agent.responsibilities.join('; ')}`,
+              `Task: ${task}`,
+              `Collaboration round: ${round} of ${totalRounds}`,
+              round > 1
+                ? 'Use peer insights from previous rounds to refine or challenge your proposal.'
+                : 'Provide your initial specialist recommendation.',
+              peerContext.length > 0 ? `Peer insights:\n${peerContext}` : 'Peer insights: (none yet)',
+              'Return concise, concrete recommendations only for this specialist role.'
+            ].join('\n');
+
+            const response = await requestChatAnswer(
+              config,
+              {
+                prompt: applyModeToPrompt(specialistPrompt, allowToolExecution ? 'agent' : 'plan'),
+                context: contextPayload
+              },
+              backendReady,
+              secrets
+            );
+
+            const text = stripInteractiveQuestionEnvelope(response.answer);
+            latestByAgent.set(agent.id, text);
+
+            let toolExecutionSummary: string | undefined;
+            if (allowToolExecution) {
+              const execution = await maybeRunAgentTools(response.answer, config, logger, agent.id);
+              if (execution.executedCount > 0 || execution.skippedReason) {
+                toolExecutionSummary = execution.executedCount > 0
+                  ? `Applied ${execution.executedCount} action(s): ${execution.executed.join(', ')}`
+                  : `No actions applied: ${execution.skippedReason ?? 'not requested'}`;
+              }
+            }
+
+            runs.push({ round, agent, response, text, toolExecutionSummary });
+          }
+        }
+
+        progress.report({ message: 'Synthesizing final recommendation...', increment: 25 });
+      }
+    );
+
+    const finalRoundByAgent = selectedAgents
+      .map((pick) => {
+        const matching = [...runs]
+          .filter((run) => run.agent.id === pick.agent.id)
+          .sort((a, b) => b.round - a.round)[0];
+        return matching;
+      })
+      .filter((item): item is AgentSwarmRun => Boolean(item));
+
+    const synthesisPrompt = [
+      `Task: ${task}`,
+      `Collaboration rounds completed: ${totalRounds}`,
+      'Combine the specialist outputs below into one practical execution plan.',
+      'Keep conflicting recommendations explicit and provide final priority order.',
+      '',
+      ...finalRoundByAgent.map(
+        (run, index) =>
+          `Specialist ${index + 1} (${run.agent.id}, round ${run.round}):\n${run.text}`
+      )
+    ].join('\n\n');
+
+    const synthesis = await requestChatAnswer(
+      config,
+      {
+        prompt: applyModeToPrompt(synthesisPrompt, 'plan'),
+        context: contextPayload
+      },
+      backendReady,
+      secrets
+    );
+
+    output.clear();
+    output.appendLine('=== Devpilot Agent Swarm ===');
+    output.appendLine(`task: ${task}`);
+    output.appendLine(`agents: ${selectedAgents.map((run) => run.agent.id).join(', ')}`);
+    output.appendLine(`rounds: ${totalRounds}`);
+    output.appendLine(`tool execution: ${allowToolExecution ? 'enabled (per-agent approvals)' : 'disabled'}`);
+    output.appendLine('');
+    for (const run of runs) {
+      output.appendLine(`--- Round ${run.round}: ${run.agent.id} (${run.agent.group}) ---`);
+      output.appendLine(run.text);
+      if (run.toolExecutionSummary) {
+        output.appendLine(`Tool execution: ${run.toolExecutionSummary}`);
+      }
+      output.appendLine('');
+    }
+    output.appendLine('=== Synthesized Plan ===');
+    output.appendLine(stripInteractiveQuestionEnvelope(synthesis.answer));
+    output.show(true);
+
+    logger.info('subagent.swarm.completed', {
+      task,
+      agents: selectedAgents.map((run) => run.agent.id),
+      rounds: totalRounds,
+      toolExecution: allowToolExecution,
+      count: runs.length,
+      provider: getCurrentProviderId(config.provider)
+    });
+    setStatusBar(statusBar, 'ready');
+    vscode.window.showInformationMessage(`Devpilot Agent Swarm complete with ${runs.length} specialist outputs across ${totalRounds} rounds.`);
+  } catch (error) {
+    const messageText = toErrorMessage(error);
+    logger.error('subagent.swarm.failed', { reason: messageText });
+    output.appendLine(`[devpilot] Agent Swarm failed: ${messageText}`);
+    output.show(true);
+    setStatusBar(statusBar, 'error');
+    vscode.window.showErrorMessage(`Devpilot Agent Swarm failed: ${messageText}`);
+  }
+}
+
+async function runReconAndPlanCommand(
+  output: vscode.OutputChannel,
+  logger: ReturnType<typeof createLogger>,
+  statusBar: vscode.StatusBarItem
+): Promise<void> {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders || folders.length === 0) {
+    vscode.window.showErrorMessage('Devpilot Recon and Plan requires an open workspace folder.');
+    return;
+  }
+
+  const modePick = await vscode.window.showQuickPick(
+    [
+      { label: 'Quick Recon', value: 'quick' as ReconMode, description: 'Fast top-level signal scan' },
+      { label: 'Deep Recon', value: 'deep' as ReconMode, description: 'Broader scan with additional checks' }
+    ],
+    { placeHolder: 'Choose recon depth' }
+  );
+
+  if (!modePick) {
+    return;
+  }
+
+  const root = folders[0].uri;
+  setStatusBar(statusBar, 'working');
+
+  try {
+    const artifacts = await vscode.window.withProgress(
+      {
+        location: vscode.ProgressLocation.Notification,
+        title: `Devpilot Recon and Plan (${modePick.value})`,
+        cancellable: false
+      },
+      async (progress) => {
+        progress.report({ message: 'Scanning workspace signals...', increment: 20 });
+        const report = await buildReconReport(root, modePick.value);
+
+        progress.report({ message: 'Ranking opportunities...', increment: 35 });
+        const plan = buildActionPlan(report);
+
+        progress.report({ message: 'Writing artifacts...', increment: 35 });
+        const paths = await writeReconArtifacts(root, report, plan);
+        const markdown = renderPlanMarkdown(report, plan);
+
+        progress.report({ message: 'Done', increment: 10 });
+        return { report, plan, markdown, paths };
+      }
+    );
+
+    output.clear();
+    output.appendLine('=== Devpilot Recon and Plan ===');
+    output.appendLine(`mode: ${modePick.value}`);
+    output.appendLine(`workspace: ${root.fsPath}`);
+    output.appendLine(`toolchain: ${artifacts.report.detectedToolchain.join(', ') || '(none detected)'}`);
+    output.appendLine(`signals: ${artifacts.report.signals.length}`);
+    output.appendLine(`opportunities: ${artifacts.plan.opportunities.length}`);
+    output.appendLine(`recon-report: ${artifacts.paths.reconReportPath}`);
+    output.appendLine(`action-plan: ${artifacts.paths.actionPlanPath}`);
+    output.appendLine(`plan-md: ${artifacts.paths.planMarkdownPath}`);
+    output.appendLine('');
+    if (artifacts.plan.opportunities.length > 0) {
+      output.appendLine('Top opportunities:');
+      artifacts.plan.opportunities.slice(0, 5).forEach((opp, index) => {
+        output.appendLine(`${index + 1}. [${opp.score.toFixed(2)}] ${opp.title} (risk=${opp.risk}, eta=${opp.etaMinutes}m)`);
+      });
+    } else {
+      output.appendLine('No opportunities detected in this run.');
+    }
+    output.show(true);
+
+    logger.info('recon.plan.completed', {
+      mode: modePick.value,
+      signals: artifacts.report.signals.length,
+      opportunities: artifacts.plan.opportunities.length,
+      reconReportPath: artifacts.paths.reconReportPath,
+      actionPlanPath: artifacts.paths.actionPlanPath,
+      planMarkdownPath: artifacts.paths.planMarkdownPath
+    });
+
+    const postAction = await vscode.window.showQuickPick(
+      [
+        { label: 'Show Full Plan', value: 'showPlan' as const },
+        { label: 'Open generated PLAN.md', value: 'openPlan' as const },
+        { label: 'Apply safe autofixes (Phase 2)', value: 'phase2' as const }
+      ],
+      { placeHolder: 'Recon complete. Choose next step.' }
+    );
+
+    if (postAction?.value === 'showPlan') {
+      output.appendLine('');
+      output.appendLine('--- PLAN.md Preview ---');
+      output.appendLine(artifacts.markdown);
+      output.show(true);
+    }
+
+    if (postAction?.value === 'openPlan') {
+      const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(artifacts.paths.planMarkdownPath));
+      await vscode.window.showTextDocument(doc, { preview: false });
+    }
+
+    if (postAction?.value === 'phase2') {
+      await runReconPhase2Autofix(root, artifacts.plan, output, logger);
+    }
+
+    setStatusBar(statusBar, 'ready');
+    vscode.window.showInformationMessage(`Devpilot Recon complete: ${artifacts.plan.opportunities.length} opportunities found.`);
+  } catch (error) {
+    const messageText = toErrorMessage(error);
+    logger.error('recon.plan.failed', { reason: messageText });
+    output.appendLine(`[devpilot] Recon and Plan failed: ${messageText}`);
+    output.show(true);
+    setStatusBar(statusBar, 'error');
+    vscode.window.showErrorMessage(`Devpilot Recon and Plan failed: ${messageText}`);
+  }
+}
+
+async function writeReconArtifacts(
+  root: vscode.Uri,
+  report: ReconReport,
+  plan: ActionPlan
+): Promise<{ reconReportPath: string; actionPlanPath: string; planMarkdownPath: string }> {
+  const baseDir = path.resolve(root.fsPath, '.devpilot');
+  const reconReportPath = path.resolve(baseDir, 'recon-report.json');
+  const actionPlanPath = path.resolve(baseDir, 'action-plan.json');
+  const planMarkdownPath = path.resolve(baseDir, 'PLAN.md');
+
+  await vscode.workspace.fs.createDirectory(vscode.Uri.file(baseDir));
+  await vscode.workspace.fs.writeFile(
+    vscode.Uri.file(reconReportPath),
+    Buffer.from(JSON.stringify(report, null, 2), 'utf-8')
+  );
+  await vscode.workspace.fs.writeFile(
+    vscode.Uri.file(actionPlanPath),
+    Buffer.from(JSON.stringify(plan, null, 2), 'utf-8')
+  );
+
+  const markdown = renderPlanMarkdown(report, plan);
+  await vscode.workspace.fs.writeFile(
+    vscode.Uri.file(planMarkdownPath),
+    Buffer.from(markdown, 'utf-8')
+  );
+
+  return { reconReportPath, actionPlanPath, planMarkdownPath };
+}
+
+async function runReconPhase2Autofix(
+  root: vscode.Uri,
+  plan: ActionPlan,
+  output: vscode.OutputChannel,
+  logger: ReturnType<typeof createLogger>
+): Promise<void> {
+  const safeOpportunities = plan.opportunities.filter((opportunity) => opportunity.autofixAvailable && isOpportunitySafeAutofix(opportunity));
+
+  if (safeOpportunities.length === 0) {
+    vscode.window.showInformationMessage('No safe autofixes are available in this plan.');
+    return;
+  }
+
+  const phase2Pick = await vscode.window.showQuickPick(
+    [
+      { label: 'Preview a safe autofix', value: 'preview' as const },
+      { label: 'Apply one safe autofix', value: 'applyOne' as const },
+      { label: 'Apply all safe autofixes (with checkpoint)', value: 'applyAll' as const },
+      { label: 'Rollback latest safe autofix batch', value: 'rollback' as const }
+    ],
+    { placeHolder: 'Choose Phase 2 autofix action' }
+  );
+
+  if (!phase2Pick) {
+    return;
+  }
+
+  if (phase2Pick.value === 'rollback') {
+    const rollback = await rollbackLatestPhase3Checkpoint(root);
+    if (!rollback) {
+      vscode.window.showInformationMessage('No Phase 3 checkpoint found to rollback.');
+      return;
+    }
+
+    output.appendLine('');
+    output.appendLine('--- Phase 3 Rollback ---');
+    output.appendLine(`checkpoint: ${rollback.checkpointId}`);
+    output.appendLine(`restored: ${rollback.restored}`);
+    output.appendLine(`deleted: ${rollback.deleted}`);
+    output.appendLine(`missing: ${rollback.missing}`);
+    output.show(true);
+
+    logger.info('recon.plan.phase3.rollback', {
+      checkpointId: rollback.checkpointId,
+      restored: rollback.restored,
+      deleted: rollback.deleted,
+      missing: rollback.missing
+    });
+
+    vscode.window.showInformationMessage(`Rolled back checkpoint ${rollback.checkpointId}.`);
+    return;
+  }
+
+  if (phase2Pick.value === 'applyAll') {
+    const batch = await applySafeAutofixBatchWithCheckpoint(root, safeOpportunities);
+    const summaries = batch.summaries;
+
+    output.appendLine('');
+    output.appendLine('--- Phase 3 Autofix Batch ---');
+    output.appendLine(`checkpoint: ${batch.checkpointId}`);
+    summaries.forEach((line) => output.appendLine(line));
+    output.show(true);
+
+    logger.info('recon.plan.phase3.batchApplied', {
+      opportunities: safeOpportunities.length,
+      summary: summaries,
+      checkpointId: batch.checkpointId,
+      appliedFiles: batch.appliedFiles,
+      skippedFiles: batch.skippedFiles
+    });
+
+    const rollbackChoice = await vscode.window.showQuickPick(
+      [
+        { label: 'Keep batch changes', value: 'keep' as const },
+        { label: 'Rollback this batch now', value: 'rollback' as const }
+      ],
+      { placeHolder: 'Phase 3 batch complete. Keep or rollback?' }
+    );
+
+    if (rollbackChoice?.value === 'rollback') {
+      const rollback = await rollbackPhase3Checkpoint(root, batch.checkpoint);
+      output.appendLine('');
+      output.appendLine('--- Phase 3 Immediate Rollback ---');
+      output.appendLine(`checkpoint: ${rollback.checkpointId}`);
+      output.appendLine(`restored: ${rollback.restored}`);
+      output.appendLine(`deleted: ${rollback.deleted}`);
+      output.appendLine(`missing: ${rollback.missing}`);
+      output.show(true);
+
+      logger.info('recon.plan.phase3.immediateRollback', {
+        checkpointId: rollback.checkpointId,
+        restored: rollback.restored,
+        deleted: rollback.deleted,
+        missing: rollback.missing
+      });
+
+      vscode.window.showInformationMessage('Rolled back safe autofix batch.');
+      return;
+    }
+
+    vscode.window.showInformationMessage(`Applied safe autofixes for ${safeOpportunities.length} opportunity(ies) with checkpoint ${batch.checkpointId}.`);
+    return;
+  }
+
+  const target = await pickSafeOpportunity(safeOpportunities, phase2Pick.value === 'preview' ? 'Preview safe autofix' : 'Apply safe autofix');
+  if (!target) {
+    return;
+  }
+
+  if (phase2Pick.value === 'preview') {
+    const preview = await buildOpportunityAutofixPreview(root, target);
+    output.appendLine('');
+    output.appendLine(`--- Phase 2 Autofix Preview: ${target.title} ---`);
+    output.appendLine(preview);
+    output.show(true);
+
+    logger.info('recon.plan.phase2.preview', { opportunityId: target.id });
+    return;
+  }
+
+  const result = await applyOpportunityAutofix(root, target);
+  output.appendLine('');
+  output.appendLine(`--- Phase 2 Autofix Apply: ${target.title} ---`);
+  output.appendLine(`Applied files: ${result.applied}`);
+  if (result.skipped.length > 0) {
+    output.appendLine('Skipped:');
+    result.skipped.forEach((reason) => output.appendLine(`- ${reason}`));
+  }
+  output.show(true);
+
+  logger.info('recon.plan.phase2.applied', {
+    opportunityId: target.id,
+    appliedFiles: result.applied,
+    skipped: result.skipped
+  });
+
+  vscode.window.showInformationMessage(`Applied safe autofix for ${target.title}.`);
+}
+
+function isOpportunitySafeAutofix(opportunity: PlanOpportunity): boolean {
+  if (!opportunity.autofixAvailable || !Array.isArray(opportunity.autofixEdits) || opportunity.autofixEdits.length === 0) {
+    return false;
+  }
+
+  return opportunity.actions.every((action) => action.safe);
+}
+
+async function pickSafeOpportunity(opportunities: PlanOpportunity[], placeHolder: string): Promise<PlanOpportunity | undefined> {
+  const selected = await vscode.window.showQuickPick(
+    opportunities.map((opportunity) => ({
+      label: opportunity.title,
+      value: opportunity.id,
+      description: `score=${opportunity.score.toFixed(2)} risk=${opportunity.risk}`
+    })),
+    { placeHolder }
+  );
+
+  if (!selected) {
+    return undefined;
+  }
+
+  return opportunities.find((opportunity) => opportunity.id === selected.value);
+}
+
+async function buildOpportunityAutofixPreview(root: vscode.Uri, opportunity: PlanOpportunity): Promise<string> {
+  const edits = opportunity.autofixEdits ?? [];
+  const lines: string[] = [];
+
+  lines.push(`Opportunity: ${opportunity.title}`);
+  lines.push(`ID: ${opportunity.id}`);
+  lines.push(`Edits: ${edits.length}`);
+  lines.push('');
+
+  for (const edit of edits) {
+    const targetUri = vscode.Uri.joinPath(root, ...edit.path.split('/'));
+    const relativeTarget = path.relative(root.fsPath, targetUri.fsPath).replace(/\\/g, '/');
+    const exists = await pathExists(targetUri);
+
+    lines.push(`File: ${relativeTarget}`);
+    lines.push(`Operation: ${exists ? 'skip (already exists)' : 'create'}`);
+    lines.push('--- Begin Content ---');
+    lines.push(edit.content);
+    lines.push('--- End Content ---');
+    lines.push('');
+  }
+
+  return lines.join('\n');
+}
+
+async function applyOpportunityAutofix(
+  root: vscode.Uri,
+  opportunity: PlanOpportunity
+): Promise<{ applied: number; skipped: string[]; appliedPaths: string[] }> {
+  const edits = opportunity.autofixEdits ?? [];
+  let applied = 0;
+  const skipped: string[] = [];
+  const appliedPaths: string[] = [];
+
+  for (const edit of edits) {
+    const targetUri = vscode.Uri.joinPath(root, ...edit.path.split('/'));
+    const relativeTarget = path.relative(root.fsPath, targetUri.fsPath).replace(/\\/g, '/');
+
+    if (await pathExists(targetUri)) {
+      skipped.push(`${relativeTarget} already exists`);
+      continue;
+    }
+
+    const parentDir = path.dirname(targetUri.fsPath);
+    await vscode.workspace.fs.createDirectory(vscode.Uri.file(parentDir));
+    await vscode.workspace.fs.writeFile(targetUri, Buffer.from(edit.content, 'utf-8'));
+    applied += 1;
+    appliedPaths.push(relativeTarget);
+  }
+
+  return { applied, skipped, appliedPaths };
+}
+
+interface Phase3CheckpointEntry {
+  path: string;
+  existed: boolean;
+  previousContentBase64?: string;
+}
+
+interface Phase3Checkpoint {
+  id: string;
+  createdAt: string;
+  workspaceRoot: string;
+  entries: Phase3CheckpointEntry[];
+}
+
+async function applySafeAutofixBatchWithCheckpoint(
+  root: vscode.Uri,
+  safeOpportunities: PlanOpportunity[]
+): Promise<{ checkpointId: string; summaries: string[]; appliedFiles: number; skippedFiles: number; checkpoint: Phase3Checkpoint }> {
+  const checkpointId = buildPhase3CheckpointId();
+  const checkpointMap = new Map<string, Phase3CheckpointEntry>();
+
+  for (const opportunity of safeOpportunities) {
+    for (const edit of opportunity.autofixEdits ?? []) {
+      const key = edit.path.replace(/\\/g, '/');
+      if (checkpointMap.has(key)) {
+        continue;
+      }
+
+      const targetUri = vscode.Uri.joinPath(root, ...edit.path.split('/'));
+      const existed = await pathExists(targetUri);
+      const entry: Phase3CheckpointEntry = { path: key, existed };
+      if (existed) {
+        const previous = await vscode.workspace.fs.readFile(targetUri);
+        entry.previousContentBase64 = Buffer.from(previous).toString('base64');
+      }
+      checkpointMap.set(key, entry);
+    }
+  }
+
+  const checkpoint: Phase3Checkpoint = {
+    id: checkpointId,
+    createdAt: new Date().toISOString(),
+    workspaceRoot: root.fsPath,
+    entries: [...checkpointMap.values()]
+  };
+
+  await writePhase3Checkpoint(root, checkpoint);
+
+  const summaries: string[] = [];
+  let appliedFiles = 0;
+  let skippedFiles = 0;
+
+  try {
+    for (const opportunity of safeOpportunities) {
+      const result = await applyOpportunityAutofix(root, opportunity);
+      appliedFiles += result.applied;
+      skippedFiles += result.skipped.length;
+      summaries.push(`${opportunity.id}: ${result.applied} applied, ${result.skipped.length} skipped`);
+    }
+  } catch (error) {
+    await rollbackPhase3Checkpoint(root, checkpoint);
+    throw new Error(`Batch apply failed and was rolled back: ${toErrorMessage(error)}`);
+  }
+
+  return { checkpointId, summaries, appliedFiles, skippedFiles, checkpoint };
+}
+
+function buildPhase3CheckpointId(): string {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  return `recon-phase3-${timestamp}`;
+}
+
+async function writePhase3Checkpoint(root: vscode.Uri, checkpoint: Phase3Checkpoint): Promise<void> {
+  const checkpointsDir = vscode.Uri.joinPath(root, '.devpilot', 'checkpoints');
+  await vscode.workspace.fs.createDirectory(checkpointsDir);
+
+  const checkpointPath = vscode.Uri.joinPath(checkpointsDir, `${checkpoint.id}.json`);
+  await vscode.workspace.fs.writeFile(
+    checkpointPath,
+    Buffer.from(JSON.stringify(checkpoint, null, 2), 'utf-8')
+  );
+}
+
+async function rollbackLatestPhase3Checkpoint(
+  root: vscode.Uri
+): Promise<{ checkpointId: string; restored: number; deleted: number; missing: number } | undefined> {
+  const files = await vscode.workspace.findFiles(
+    new vscode.RelativePattern(root, '.devpilot/checkpoints/recon-phase3-*.json'),
+    '**/node_modules/**',
+    50
+  );
+
+  if (files.length === 0) {
+    return undefined;
+  }
+
+  const latest = files.sort((a, b) => b.path.localeCompare(a.path))[0];
+  const raw = await vscode.workspace.fs.readFile(latest);
+  const checkpoint = JSON.parse(Buffer.from(raw).toString('utf-8')) as Phase3Checkpoint;
+  const result = await rollbackPhase3Checkpoint(root, checkpoint);
+
+  return result;
+}
+
+async function rollbackPhase3Checkpoint(
+  root: vscode.Uri,
+  checkpoint: Phase3Checkpoint
+): Promise<{ checkpointId: string; restored: number; deleted: number; missing: number }> {
+  let restored = 0;
+  let deleted = 0;
+  let missing = 0;
+
+  for (const entry of [...checkpoint.entries].reverse()) {
+    const targetUri = vscode.Uri.joinPath(root, ...entry.path.split('/'));
+
+    if (entry.existed) {
+      if (typeof entry.previousContentBase64 === 'string') {
+        const content = Buffer.from(entry.previousContentBase64, 'base64');
+        await vscode.workspace.fs.writeFile(targetUri, content);
+        restored += 1;
+      } else {
+        missing += 1;
+      }
+      continue;
+    }
+
+    if (await pathExists(targetUri)) {
+      await vscode.workspace.fs.delete(targetUri, { recursive: false, useTrash: false });
+      deleted += 1;
+    } else {
+      missing += 1;
+    }
+  }
+
+  return { checkpointId: checkpoint.id, restored, deleted, missing };
+}
+
+async function pathExists(uri: vscode.Uri): Promise<boolean> {
+  try {
+    await vscode.workspace.fs.stat(uri);
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -1209,6 +2250,179 @@ async function runConfigureToolsCommand(logger: ReturnType<typeof createLogger>)
   logger.info('tools.configured', { enabledToolIds });
 }
 
+async function runManageAgentPermissionsCommand(
+  context: vscode.ExtensionContext,
+  logger: ReturnType<typeof createLogger>
+): Promise<void> {
+  if (AGENT_PERMISSIONS_PANEL) {
+    AGENT_PERMISSIONS_PANEL.reveal(vscode.ViewColumn.Beside, true);
+    await publishAgentPermissionsState(AGENT_PERMISSIONS_PANEL.webview);
+    return;
+  }
+
+  AGENT_PERMISSIONS_PANEL = vscode.window.createWebviewPanel(
+    AGENT_PERMISSIONS_PANEL_ID,
+    AGENT_PERMISSIONS_PANEL_TITLE,
+    vscode.ViewColumn.Beside,
+    { enableScripts: true, retainContextWhenHidden: true }
+  );
+
+  AGENT_PERMISSIONS_PANEL.webview.html = getAgentPermissionsWebviewHtml();
+  AGENT_PERMISSIONS_PANEL.onDidDispose(() => {
+    AGENT_PERMISSIONS_PANEL = undefined;
+  }, undefined, context.subscriptions);
+
+  AGENT_PERMISSIONS_PANEL.webview.onDidReceiveMessage(async (message: { type?: string; key?: string }) => {
+    if (!message?.type) {
+      return;
+    }
+
+    if (message.type === 'ready' || message.type === 'refresh') {
+      await publishAgentPermissionsState(AGENT_PERMISSIONS_PANEL?.webview);
+      return;
+    }
+
+    if (message.type === 'add') {
+      const toast = await addAgentPermissionEntries(logger);
+      await publishAgentPermissionsState(AGENT_PERMISSIONS_PANEL?.webview, toast);
+      return;
+    }
+
+    if (message.type === 'revoke') {
+      const key = (message.key ?? '').trim();
+      if (!key) {
+        await publishAgentPermissionsState(AGENT_PERMISSIONS_PANEL?.webview, 'No permission key provided.');
+        return;
+      }
+
+      const cfg = vscode.workspace.getConfiguration('devpilot');
+      const current = new Set(cfg.get<string[]>('agentToolWorkspaceAllowed', []));
+      if (!current.has(key)) {
+        await publishAgentPermissionsState(AGENT_PERMISSIONS_PANEL?.webview, `Permission not found: ${key}`);
+        return;
+      }
+
+      current.delete(key);
+      const next = [...current].sort((a, b) => a.localeCompare(b));
+      await cfg.update('agentToolWorkspaceAllowed', next, vscode.ConfigurationTarget.Workspace);
+      logger.info('tools.agent_permissions_removed', { removed: [key], count: 1 });
+      await publishAgentPermissionsState(AGENT_PERMISSIONS_PANEL?.webview, `Revoked ${key}.`);
+      return;
+    }
+
+    if (message.type === 'clear') {
+      const choice = await vscode.window.showWarningMessage(
+        'Clear all workspace agent-tool permissions?',
+        { modal: true },
+        'Clear All',
+        'Cancel'
+      );
+
+      if (choice !== 'Clear All') {
+        await publishAgentPermissionsState(AGENT_PERMISSIONS_PANEL?.webview, 'Clear cancelled.');
+        return;
+      }
+
+      const cfg = vscode.workspace.getConfiguration('devpilot');
+      await cfg.update('agentToolWorkspaceAllowed', [], vscode.ConfigurationTarget.Workspace);
+      logger.info('tools.agent_permissions_cleared', {});
+      await publishAgentPermissionsState(AGENT_PERMISSIONS_PANEL?.webview, 'Cleared all agent-tool permissions.');
+    }
+  }, undefined, context.subscriptions);
+
+  await publishAgentPermissionsState(AGENT_PERMISSIONS_PANEL.webview);
+}
+
+async function addAgentPermissionEntries(logger: ReturnType<typeof createLogger>): Promise<string> {
+  const cfg = vscode.workspace.getConfiguration('devpilot');
+  const current = new Set(cfg.get<string[]>('agentToolWorkspaceAllowed', []));
+
+  const agentPicks = await vscode.window.showQuickPick(
+    ALL_DEVPILOT_AGENTS.map((agent) => ({
+      label: agent.id,
+      value: agent.id,
+      description: `${agent.group} - ${agent.title}`
+    })),
+    {
+      canPickMany: true,
+      placeHolder: 'Select agent(s) to grant permissions'
+    }
+  );
+
+  if (!agentPicks || agentPicks.length === 0) {
+    return 'Add cancelled: no agents selected.';
+  }
+
+  const toolPicks = await vscode.window.showQuickPick(
+    CONFIGURABLE_TOOLS.map((tool) => ({
+      label: tool.id,
+      value: tool.id,
+      description: `${tool.category} | risk=${tool.risk}`,
+      detail: tool.description
+    })),
+    {
+      canPickMany: true,
+      placeHolder: 'Select tool(s) to allow for selected agents'
+    }
+  );
+
+  if (!toolPicks || toolPicks.length === 0) {
+    return 'Add cancelled: no tools selected.';
+  }
+
+  const added: string[] = [];
+  for (const agent of agentPicks) {
+    for (const tool of toolPicks) {
+      const key = makeAgentToolKey(agent.value, tool.value);
+      if (!current.has(key)) {
+        current.add(key);
+        added.push(key);
+      }
+    }
+  }
+
+  const next = [...current].sort((a, b) => a.localeCompare(b));
+  await cfg.update('agentToolWorkspaceAllowed', next, vscode.ConfigurationTarget.Workspace);
+  logger.info('tools.agent_permissions_added', { added, count: added.length });
+  return added.length > 0
+    ? `Added ${added.length} agent-tool permission(s).`
+    : 'Selected permissions were already present.';
+}
+
+async function publishAgentPermissionsState(webview: vscode.Webview | undefined, toast?: string): Promise<void> {
+  if (!webview) {
+    return;
+  }
+
+  const cfg = vscode.workspace.getConfiguration('devpilot');
+  const values = cfg.get<string[]>('agentToolWorkspaceAllowed', []).slice().sort((a, b) => a.localeCompare(b));
+
+  const entries = values.map((key) => {
+    const [agentId, toolId] = splitAgentToolKey(key);
+    return {
+      key,
+      agentId,
+      toolId
+    };
+  });
+
+  webview.postMessage({
+    type: 'permissionsState',
+    entries,
+    total: entries.length,
+    toast
+  });
+}
+
+function splitAgentToolKey(key: string): [string, string] {
+  const index = key.indexOf(':');
+  if (index <= 0 || index >= key.length - 1) {
+    return [key, '(invalid key)'];
+  }
+
+  return [key.slice(0, index), key.slice(index + 1)];
+}
+
 async function safelyListModels(
   client: LlmProviderClient,
   fallbackModel: string,
@@ -1282,6 +2496,8 @@ function applyModeToPrompt(prompt: string, mode: DevpilotChatMode): string {
       'When file edits are required, append a tool envelope at the end using this exact format:',
       '<devpilot-tools>{"actions":[{"type":"write_file","path":"relative/path.ext","content":"full file content"}]}</devpilot-tools>',
       'Supported actions: create_directory, create_file, create_jupyter_notebook, edit_file, write_file, replace_in_file, rename_file, search_workspace, open_browser_page, navigate_page, read_page, screenshot_page, type_in_page, hover_element, run_playwright_code.',
+      'If you need explicit user confirmation, append one interactive envelope at the end using JSON only: <devpilot-question>{"kind":"yes_no","question":"Apply these edits now?"}</devpilot-question>.',
+      'For multiple-choice prompts use: <devpilot-question>{"kind":"single_select","question":"Choose next step","options":["Option A","Option B"]}</devpilot-question>.',
       'Use workspace-relative paths only and include valid JSON without markdown fences inside the envelope.',
       prompt
     ].join('\n\n');
@@ -1331,7 +2547,8 @@ async function getActiveEditorAttachment(existingPaths: string[]): Promise<Attac
 async function maybeRunAgentTools(
   answer: string,
   config: ReturnType<typeof getDevpilotConfig>,
-  logger: ReturnType<typeof createLogger>
+  logger: ReturnType<typeof createLogger>,
+  agentId?: string
 ): Promise<{ executedCount: number; executed: string[]; skippedReason?: string }> {
   const envelope = parseAgentToolEnvelope(answer);
   if (!envelope || envelope.actions.length === 0) {
@@ -1378,13 +2595,38 @@ async function maybeRunAgentTools(
           outcome: 'skipped',
           durationMs: 0,
           details,
-          error: 'approval denied'
+          error: 'approval denied',
+          replayAction: action
         },
         config.toolAuditMaxEntries,
         logger
       );
       skippedReason = `approval denied for ${toolId}`;
       continue;
+    }
+
+    if (agentId) {
+      const agentApproval = await resolveAgentToolApproval(agentId, toolId, config.agentToolWorkspaceAllowed);
+      if (!agentApproval.allowed) {
+        const details = summarizeActionDetails(action);
+        appendToolAudit(
+          {
+            ts: new Date().toISOString(),
+            toolId,
+            actionType: action.type,
+            approval: 'blocked',
+            outcome: 'skipped',
+            durationMs: 0,
+            details: `${details}:agent=${agentId}`,
+            error: 'agent-level approval denied',
+            replayAction: action
+          },
+          config.toolAuditMaxEntries,
+          logger
+        );
+        skippedReason = `agent-level approval denied for ${agentId}:${toolId}`;
+        continue;
+      }
     }
 
     const startedAt = Date.now();
@@ -1400,7 +2642,8 @@ async function maybeRunAgentTools(
           approval: approval.scope,
           outcome: 'applied',
           durationMs: Date.now() - startedAt,
-          details
+          details,
+          replayAction: action
         },
         config.toolAuditMaxEntries,
         logger
@@ -1415,7 +2658,8 @@ async function maybeRunAgentTools(
           outcome: 'failed',
           durationMs: Date.now() - startedAt,
           details,
-          error: toErrorMessage(error)
+          error: toErrorMessage(error),
+          replayAction: action
         },
         config.toolAuditMaxEntries,
         logger
@@ -1425,6 +2669,54 @@ async function maybeRunAgentTools(
   }
 
   return { executedCount: executed.length, executed, skippedReason };
+}
+
+function makeAgentToolKey(agentId: string, toolId: string): string {
+  return `${agentId}:${toolId}`;
+}
+
+async function resolveAgentToolApproval(
+  agentId: string,
+  toolId: string,
+  workspaceAllowedAgentTools: string[]
+): Promise<{ allowed: boolean; scope: ToolExecutionAuditRecord['approval'] }> {
+  const key = makeAgentToolKey(agentId, toolId);
+
+  if (workspaceAllowedAgentTools.includes(key)) {
+    return { allowed: true, scope: 'allowWorkspace' };
+  }
+
+  if (SESSION_ALLOWED_AGENT_TOOL_KEYS.has(key)) {
+    return { allowed: true, scope: 'allowSession' };
+  }
+
+  const choice = await vscode.window.showWarningMessage(
+    `Agent ${agentId} requested tool: ${toolId}`,
+    { modal: true },
+    'Allow Once',
+    'Allow for Agent Session',
+    'Allow for Agent Workspace',
+    'Cancel'
+  );
+
+  if (choice === 'Allow for Agent Session') {
+    SESSION_ALLOWED_AGENT_TOOL_KEYS.add(key);
+    return { allowed: true, scope: 'allowSession' };
+  }
+
+  if (choice === 'Allow for Agent Workspace') {
+    const cfg = vscode.workspace.getConfiguration('devpilot');
+    const current = new Set(cfg.get<string[]>('agentToolWorkspaceAllowed', []));
+    current.add(key);
+    await cfg.update('agentToolWorkspaceAllowed', [...current].sort((a, b) => a.localeCompare(b)), vscode.ConfigurationTarget.Workspace);
+    return { allowed: true, scope: 'allowWorkspace' };
+  }
+
+  if (choice === 'Allow Once') {
+    return { allowed: true, scope: 'askEveryTime' };
+  }
+
+  return { allowed: false, scope: 'blocked' };
 }
 
 function getDefaultScopeForRisk(
@@ -1526,6 +2818,11 @@ function appendToolAudit(
   maxEntries: number,
   logger: ReturnType<typeof createLogger>
 ): void {
+  if (!record.id) {
+    TOOL_AUDIT_SEQ += 1;
+    record.id = TOOL_AUDIT_SEQ;
+  }
+
   TOOL_EXECUTION_AUDIT.push(record);
   if (TOOL_EXECUTION_AUDIT.length > maxEntries) {
     TOOL_EXECUTION_AUDIT.splice(0, TOOL_EXECUTION_AUDIT.length - maxEntries);
@@ -1540,6 +2837,8 @@ function appendToolAudit(
     details: record.details,
     error: record.error
   });
+
+  publishToolAuditState(TOOL_AUDIT_PANEL?.webview);
 }
 
 function parseAgentToolEnvelope(answer: string): AgentToolEnvelope | undefined {
@@ -2415,31 +3714,48 @@ function enrichPromptWithAttachments(prompt: string, attachedFiles: AttachedFile
   ].join('\n');
 }
 
-function buildInlineSuggestionPayload(
+async function buildInlineSuggestionPayload(
   request: InlineLlmSuggestionRequest,
-  enableGuardrails: boolean
-): ChatRequestPayload {
+  config: ReturnType<typeof getDevpilotConfig>
+): Promise<ChatRequestPayload> {
   const doc = request.document;
   const position = request.position;
 
-  const startLine = Math.max(0, position.line - 12);
-  const endLine = Math.min(doc.lineCount - 1, position.line + 12);
+  const fullText = doc.getText();
+  const useFullFileContext = config.inlineContextMode === 'fullFileWhenSmall' && fullText.length <= config.inlineMaxFileChars;
+  const startLine = useFullFileContext ? 0 : Math.max(0, position.line - 30);
+  const endLine = useFullFileContext ? Math.max(0, doc.lineCount - 1) : Math.min(doc.lineCount - 1, position.line + 24);
   const range = new vscode.Range(startLine, 0, endLine, doc.lineAt(endLine).text.length);
-  const surroundingContent = doc.getText(range).slice(0, 5000);
-  const inlineAttachments = request.attachedFiles
-    .slice(0, 1)
-    .map((file) => ({ ...file, content: file.content.slice(0, 2000) }));
+  const snippetText = doc.getText(range);
+  const surroundingContent = injectCursorMarker(snippetText, startLine, position).slice(0, useFullFileContext ? config.inlineMaxFileChars + 256 : 12000);
+  const currentLineSuffix = doc.lineAt(position.line).text.slice(position.character, position.character + 120);
+  const localDiagnostics = summarizeInlineDiagnostics(doc.uri, position.line);
+  const importedFiles = config.inlineIncludeImportedFiles
+    ? await resolveImportedInlineAttachments(doc, config.inlineImportedFilesLimit, 1400)
+    : [];
+  const inlineAttachments = [...request.attachedFiles, ...importedFiles]
+    .filter((file, index, all) => all.findIndex((other) => other.path === file.path) === index)
+    .slice(0, 4)
+    .map((file) => ({ ...file, content: file.content.slice(0, 1400) }));
 
   const promptBase = [
     'You are completing code inline in VS Code.',
     'Return only the continuation text to insert at cursor.',
+    'Prefer short, syntactically-correct continuations over long rewrites.',
+    'The context includes <|cursor|> marker. Continue exactly at that marker position.',
+    'Preserve surrounding function/block structure and indentation.',
+    'Do not duplicate return statements, decorators, imports, or closing braces/brackets.',
+    'Do not repeat lines or statements.',
+    'If you produce multiple lines, keep them structurally valid and properly separated by newlines.',
     'Do not use markdown, backticks, explanations, comments, or repeated prefix.',
     `Current line prefix: ${request.linePrefix}`,
+    `Current line suffix: ${currentLineSuffix || '(none)'}`,
+    `Context mode: ${useFullFileContext ? 'full-file' : 'window'}`,
     `Language: ${doc.languageId}`
   ].join('\n');
 
   const promptWithAttachments = enrichPromptWithAttachments(promptBase, inlineAttachments);
-  const prompt = enableGuardrails ? sanitizePrompt(promptWithAttachments) : promptWithAttachments;
+  const prompt = config.enableGuardrails ? sanitizePrompt(promptWithAttachments) : promptWithAttachments;
 
   const context: ChatContextPayload = {
     activeFile: doc.fileName,
@@ -2447,8 +3763,8 @@ function buildInlineSuggestionPayload(
     cursor: `line ${position.line + 1}, col ${position.character + 1}`,
     selectionSummary: `Selection: (none)`,
     selectionRange: `start(${position.line + 1}:${position.character + 1}) end(${position.line + 1}:${position.character + 1})`,
-    activeFileContent: enableGuardrails ? sanitizeContextString(surroundingContent) : surroundingContent,
-    diagnosticsSummary: '(inline suggestion path) diagnostics omitted for latency',
+    activeFileContent: config.enableGuardrails ? sanitizeContextString(surroundingContent) : surroundingContent,
+    diagnosticsSummary: localDiagnostics,
     gitDiffSummary: '(inline suggestion path) git diff omitted for latency'
   };
 
@@ -2456,6 +3772,179 @@ function buildInlineSuggestionPayload(
     prompt,
     context
   };
+}
+
+async function resolveImportedInlineAttachments(
+  document: vscode.TextDocument,
+  maxFiles: number,
+  maxCharsPerFile: number
+): Promise<AttachedFileContext[]> {
+  if (maxFiles <= 0) {
+    return [];
+  }
+
+  const importSpecifiers = extractRelativeImportSpecifiers(document.getText(), document.languageId);
+  if (importSpecifiers.length === 0) {
+    return [];
+  }
+
+  const results: AttachedFileContext[] = [];
+  for (const specifier of importSpecifiers) {
+    if (results.length >= maxFiles) {
+      break;
+    }
+
+    const filePath = await resolveImportSpecifierToFile(document.fileName, document.languageId, specifier);
+    if (!filePath) {
+      continue;
+    }
+
+    try {
+      const bytes = await vscode.workspace.fs.readFile(vscode.Uri.file(filePath));
+      const content = Buffer.from(bytes).toString('utf8').slice(0, maxCharsPerFile);
+      results.push({
+        path: filePath,
+        name: path.basename(filePath),
+        content
+      });
+    } catch {
+      // Ignore unreadable imported files in inline mode.
+    }
+  }
+
+  return results;
+}
+
+function extractRelativeImportSpecifiers(source: string, languageId: string): string[] {
+  const values = new Set<string>();
+
+  if (languageId === 'javascript' || languageId === 'javascriptreact' || languageId === 'typescript' || languageId === 'typescriptreact') {
+    const importFrom = /from\s+['"]([^'"\n]+)['"]/g;
+    const importOnly = /import\s+['"]([^'"\n]+)['"]/g;
+    const requireCall = /require\(\s*['"]([^'"\n]+)['"]\s*\)/g;
+    for (const regex of [importFrom, importOnly, requireCall]) {
+      let match = regex.exec(source);
+      while (match) {
+        if (match[1].startsWith('.')) {
+          values.add(match[1]);
+        }
+        match = regex.exec(source);
+      }
+    }
+  }
+
+  if (languageId === 'python') {
+    const fromImport = /^\s*from\s+([.][A-Za-z0-9_\.]+)\s+import\s+/gm;
+    let match = fromImport.exec(source);
+    while (match) {
+      values.add(match[1]);
+      match = fromImport.exec(source);
+    }
+  }
+
+  return [...values];
+}
+
+async function resolveImportSpecifierToFile(
+  currentFilePath: string,
+  languageId: string,
+  specifier: string
+): Promise<string | undefined> {
+  const fromDir = path.dirname(currentFilePath);
+
+  if (languageId === 'python') {
+    return await resolvePythonRelativeImport(fromDir, specifier);
+  }
+
+  const base = path.resolve(fromDir, specifier);
+  const candidates = [
+    base,
+    `${base}.ts`,
+    `${base}.tsx`,
+    `${base}.js`,
+    `${base}.jsx`,
+    `${base}.mjs`,
+    `${base}.cjs`,
+    path.join(base, 'index.ts'),
+    path.join(base, 'index.tsx'),
+    path.join(base, 'index.js'),
+    path.join(base, 'index.jsx')
+  ];
+
+  return await firstExistingFile(candidates);
+}
+
+async function resolvePythonRelativeImport(fromDir: string, specifier: string): Promise<string | undefined> {
+  const match = specifier.match(/^(\.+)(.*)$/);
+  if (!match) {
+    return undefined;
+  }
+
+  const dots = match[1].length;
+  const remainder = (match[2] || '').replace(/\./g, path.sep);
+  let baseDir = fromDir;
+  for (let i = 1; i < dots; i += 1) {
+    baseDir = path.dirname(baseDir);
+  }
+
+  const base = remainder ? path.join(baseDir, remainder) : baseDir;
+  const candidates = [
+    `${base}.py`,
+    path.join(base, '__init__.py')
+  ];
+
+  return await firstExistingFile(candidates);
+}
+
+async function firstExistingFile(candidates: string[]): Promise<string | undefined> {
+  for (const candidate of candidates) {
+    try {
+      const stat = await vscode.workspace.fs.stat(vscode.Uri.file(candidate));
+      if (stat.type === vscode.FileType.File) {
+        return candidate;
+      }
+    } catch {
+      // Candidate missing.
+    }
+  }
+
+  return undefined;
+}
+
+function injectCursorMarker(snippetText: string, snippetStartLine: number, position: vscode.Position): string {
+  const lines = snippetText.split('\n');
+  const relativeLine = position.line - snippetStartLine;
+  if (relativeLine < 0 || relativeLine >= lines.length) {
+    return snippetText;
+  }
+
+  const target = lines[relativeLine] ?? '';
+  const safeChar = Math.max(0, Math.min(position.character, target.length));
+  lines[relativeLine] = `${target.slice(0, safeChar)}<|cursor|>${target.slice(safeChar)}`;
+  return lines.join('\n');
+}
+
+function summarizeInlineDiagnostics(uri: vscode.Uri, cursorLine: number): string {
+  const relevant = vscode.languages
+    .getDiagnostics(uri)
+    .filter((diag) => {
+      if (diag.severity !== vscode.DiagnosticSeverity.Error && diag.severity !== vscode.DiagnosticSeverity.Warning) {
+        return false;
+      }
+
+      return Math.abs(diag.range.start.line - cursorLine) <= 2;
+    })
+    .slice(0, 5)
+    .map((diag) => {
+      const severity = diag.severity === vscode.DiagnosticSeverity.Error ? 'error' : 'warning';
+      return `${severity} at line ${diag.range.start.line + 1}: ${diag.message}`;
+    });
+
+  if (relevant.length === 0) {
+    return '(inline suggestion path) no nearby diagnostics';
+  }
+
+  return relevant.join('\n');
 }
 
 function sanitizeContextString(value: string): string {
@@ -2916,6 +4405,558 @@ function getWebviewHtml(): string {
   </script>
 </body>
 </html>`;
+}
+
+function getToolAuditWebviewHtml(): string {
+  return /* html */ `
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Devpilot Tool Audit Timeline</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0a0f1f;
+      color: #e8efff;
+    }
+    .wrap {
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+    .header {
+      padding: 12px;
+      border-bottom: 1px solid #24355f;
+      background: linear-gradient(180deg, #122041 0%, #0a0f1f 100%);
+    }
+    .title {
+      font-weight: 700;
+      font-size: 14px;
+    }
+    .subtitle {
+      color: #95a8d8;
+      font-size: 12px;
+      margin-top: 2px;
+    }
+    .controls {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+    .controls button,
+    .controls select,
+    .controls input {
+      border: 1px solid #314b83;
+      background: #101a32;
+      color: #e8efff;
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-size: 12px;
+    }
+    .controls button {
+      cursor: pointer;
+      background: #2453c9;
+      border-color: #3d66d1;
+      font-weight: 600;
+    }
+    .controls button.secondary {
+      background: #1a274a;
+      border-color: #2a3f74;
+    }
+    .rowAction {
+      margin-right: 6px;
+      margin-bottom: 4px;
+      cursor: pointer;
+      border: 1px solid #314b83;
+      background: #1a274a;
+      color: #e8efff;
+      border-radius: 6px;
+      padding: 3px 8px;
+      font-size: 11px;
+    }
+    .rowAction:disabled {
+      cursor: not-allowed;
+      opacity: 0.45;
+    }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(80px, 1fr));
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .card {
+      background: #101a32;
+      border: 1px solid #24355f;
+      border-radius: 8px;
+      padding: 8px;
+    }
+    .card .label {
+      color: #95a8d8;
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.02em;
+    }
+    .card .value {
+      font-size: 16px;
+      font-weight: 700;
+      margin-top: 2px;
+    }
+    .tableWrap {
+      padding: 12px;
+      overflow: auto;
+      flex: 1;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    th, td {
+      border-bottom: 1px solid #1f2f57;
+      text-align: left;
+      padding: 8px 6px;
+      vertical-align: top;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      background: #0f1933;
+      color: #a8b9e8;
+      font-weight: 600;
+      z-index: 1;
+    }
+    .pill {
+      display: inline-block;
+      border-radius: 999px;
+      padding: 2px 8px;
+      font-size: 11px;
+      font-weight: 600;
+    }
+    .pill.applied { background: #163d2d; color: #93f0c0; }
+    .pill.failed { background: #4a1d25; color: #ffc3ce; }
+    .pill.skipped { background: #4a3c1a; color: #ffe4aa; }
+    .muted {
+      color: #95a8d8;
+      font-size: 11px;
+    }
+    .toast {
+      margin-top: 8px;
+      color: #9fd6ff;
+      font-size: 12px;
+      min-height: 18px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <div class="title">Devpilot Tool Audit Timeline</div>
+      <div class="subtitle">Recent tool events, outcomes, approvals, and timings</div>
+      <div class="controls">
+        <button id="refresh">Refresh</button>
+        <button id="export" class="secondary">Export JSON</button>
+        <button id="clear" class="secondary">Clear</button>
+        <select id="outcomeFilter">
+          <option value="all">All outcomes</option>
+          <option value="applied">Applied</option>
+          <option value="failed">Failed</option>
+          <option value="skipped">Skipped</option>
+        </select>
+        <input id="textFilter" type="text" placeholder="Filter tool/details" />
+      </div>
+      <div class="summary">
+        <div class="card"><div class="label">Total</div><div class="value" id="totalCount">0</div></div>
+        <div class="card"><div class="label">Applied</div><div class="value" id="appliedCount">0</div></div>
+        <div class="card"><div class="label">Failed</div><div class="value" id="failedCount">0</div></div>
+        <div class="card"><div class="label">Skipped</div><div class="value" id="skippedCount">0</div></div>
+      </div>
+      <div id="toast" class="toast"></div>
+    </div>
+    <div class="tableWrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Time</th>
+            <th>Outcome</th>
+            <th>Tool</th>
+            <th>Approval</th>
+            <th>Duration</th>
+            <th>Details</th>
+            <th>Error</th>
+            <th>Actions</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const vscode = acquireVsCodeApi();
+    const rowsEl = document.getElementById('rows');
+    const toastEl = document.getElementById('toast');
+    const outcomeFilterEl = document.getElementById('outcomeFilter');
+    const textFilterEl = document.getElementById('textFilter');
+    const totalCountEl = document.getElementById('totalCount');
+    const appliedCountEl = document.getElementById('appliedCount');
+    const failedCountEl = document.getElementById('failedCount');
+    const skippedCountEl = document.getElementById('skippedCount');
+
+    let entries = [];
+
+    function escapeHtml(value) {
+      return String(value || '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function applyFilters() {
+      const outcome = outcomeFilterEl.value;
+      const text = textFilterEl.value.trim().toLowerCase();
+      const filtered = entries.filter((entry) => {
+        if (outcome !== 'all' && entry.outcome !== outcome) {
+          return false;
+        }
+
+        if (!text) {
+          return true;
+        }
+
+        const haystack = [entry.toolId, entry.actionType, entry.details, entry.error || ''].join(' ').toLowerCase();
+        return haystack.includes(text);
+      });
+
+      rowsEl.innerHTML = filtered
+        .slice()
+        .reverse()
+        .map((entry) => {
+          const outcomeClass = entry.outcome === 'applied' ? 'applied' : (entry.outcome === 'failed' ? 'failed' : 'skipped');
+          const copyDisabled = entry.hasReplayAction ? '' : ' disabled';
+          const rerunDisabled = entry.canReplay ? '' : ' disabled';
+          return '<tr>' +
+            '<td>' + escapeHtml(new Date(entry.ts).toLocaleTimeString()) + '<div class="muted">' + escapeHtml(new Date(entry.ts).toLocaleDateString()) + '</div></td>' +
+            '<td><span class="pill ' + outcomeClass + '">' + escapeHtml(entry.outcome) + '</span></td>' +
+            '<td>' + escapeHtml(entry.toolId) + '<div class="muted">' + escapeHtml(entry.actionType) + '</div></td>' +
+            '<td>' + escapeHtml(entry.approval) + '</td>' +
+            '<td>' + escapeHtml(entry.durationMs) + ' ms</td>' +
+            '<td>' + escapeHtml(entry.details) + '</td>' +
+            '<td>' + escapeHtml(entry.error || '') + '</td>' +
+            '<td>' +
+              '<button class="rowAction" data-action="copy" data-id="' + escapeHtml(entry.id) + '"' + copyDisabled + '>Copy Action</button>' +
+              '<button class="rowAction" data-action="rerun" data-id="' + escapeHtml(entry.id) + '"' + rerunDisabled + '>Rerun Safe</button>' +
+            '</td>' +
+            '</tr>';
+        })
+        .join('');
+    }
+
+    function setSummary(summary) {
+      totalCountEl.textContent = String(summary.total || 0);
+      appliedCountEl.textContent = String(summary.applied || 0);
+      failedCountEl.textContent = String(summary.failed || 0);
+      skippedCountEl.textContent = String(summary.skipped || 0);
+    }
+
+    document.getElementById('refresh').addEventListener('click', () => {
+      vscode.postMessage({ type: 'refresh' });
+    });
+
+    document.getElementById('export').addEventListener('click', () => {
+      vscode.postMessage({ type: 'export' });
+    });
+
+    document.getElementById('clear').addEventListener('click', () => {
+      vscode.postMessage({ type: 'clear' });
+    });
+
+    rowsEl.addEventListener('click', (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) {
+        return;
+      }
+
+      if (!target.classList.contains('rowAction')) {
+        return;
+      }
+
+      const action = target.dataset.action;
+      const id = Number(target.dataset.id || '');
+      if (!Number.isInteger(id)) {
+        return;
+      }
+
+      if (action === 'copy') {
+        vscode.postMessage({ type: 'copyAction', id });
+        return;
+      }
+
+      if (action === 'rerun') {
+        vscode.postMessage({ type: 'rerunAction', id });
+      }
+    });
+
+    outcomeFilterEl.addEventListener('change', applyFilters);
+    textFilterEl.addEventListener('input', applyFilters);
+
+    window.addEventListener('message', (event) => {
+      const message = event.data || {};
+      if (message.type !== 'auditState') {
+        return;
+      }
+
+      entries = Array.isArray(message.entries) ? message.entries : [];
+      setSummary(message.summary || {});
+      toastEl.textContent = message.toast || '';
+      applyFilters();
+    });
+
+    vscode.postMessage({ type: 'ready' });
+  </script>
+</body>
+</html>
+`;
+}
+
+function getAgentPermissionsWebviewHtml(): string {
+  return /* html */ `
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Devpilot Agent Permissions</title>
+  <style>
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: #0a0f1f;
+      color: #e8efff;
+    }
+    .wrap {
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+    }
+    .header {
+      padding: 12px;
+      border-bottom: 1px solid #24355f;
+      background: linear-gradient(180deg, #122041 0%, #0a0f1f 100%);
+    }
+    .title {
+      font-weight: 700;
+      font-size: 14px;
+    }
+    .subtitle {
+      color: #95a8d8;
+      font-size: 12px;
+      margin-top: 2px;
+    }
+    .controls {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+    .controls button,
+    .controls input {
+      border: 1px solid #314b83;
+      background: #101a32;
+      color: #e8efff;
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-size: 12px;
+    }
+    .controls button {
+      cursor: pointer;
+      background: #2453c9;
+      border-color: #3d66d1;
+      font-weight: 600;
+    }
+    .controls button.secondary {
+      background: #1a274a;
+      border-color: #2a3f74;
+    }
+    .controls button.danger {
+      background: #5a2230;
+      border-color: #8a3c52;
+    }
+    .summary {
+      margin-top: 8px;
+      color: #95a8d8;
+      font-size: 12px;
+    }
+    .toast {
+      margin-top: 8px;
+      color: #9fd6ff;
+      font-size: 12px;
+      min-height: 18px;
+    }
+    .tableWrap {
+      padding: 12px;
+      overflow: auto;
+      flex: 1;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    th, td {
+      border-bottom: 1px solid #1f2f57;
+      text-align: left;
+      padding: 8px 6px;
+      vertical-align: top;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      background: #0f1933;
+      color: #a8b9e8;
+      font-weight: 600;
+      z-index: 1;
+    }
+    .rowAction {
+      cursor: pointer;
+      border: 1px solid #8a3c52;
+      background: #5a2230;
+      color: #ffd5de;
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-size: 11px;
+    }
+    .muted {
+      color: #95a8d8;
+      font-size: 11px;
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="header">
+      <div class="title">Devpilot Agent Permissions</div>
+      <div class="subtitle">Workspace-scoped agent tool approvals in format agentId:toolId</div>
+      <div class="controls">
+        <button id="add">Add Permissions</button>
+        <button id="refresh" class="secondary">Refresh</button>
+        <button id="clear" class="danger">Clear All</button>
+        <input id="filter" type="text" placeholder="Filter by agent or tool" />
+      </div>
+      <div class="summary">Total permissions: <span id="total">0</span></div>
+      <div id="toast" class="toast"></div>
+    </div>
+    <div class="tableWrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Agent</th>
+            <th>Tool</th>
+            <th>Key</th>
+            <th>Action</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const vscode = acquireVsCodeApi();
+    const rowsEl = document.getElementById('rows');
+    const totalEl = document.getElementById('total');
+    const filterEl = document.getElementById('filter');
+    const toastEl = document.getElementById('toast');
+    let entries = [];
+
+    function escapeHtml(value) {
+      return String(value || '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    function applyFilter() {
+      const text = filterEl.value.trim().toLowerCase();
+      const filtered = entries.filter((entry) => {
+        if (!text) {
+          return true;
+        }
+
+        const haystack = [entry.agentId, entry.toolId, entry.key].join(' ').toLowerCase();
+        return haystack.includes(text);
+      });
+
+      rowsEl.innerHTML = filtered
+        .map((entry) => {
+          return '<tr>' +
+            '<td>' + escapeHtml(entry.agentId) + '</td>' +
+            '<td>' + escapeHtml(entry.toolId) + '</td>' +
+            '<td><span class="muted">' + escapeHtml(entry.key) + '</span></td>' +
+            '<td><button class="rowAction" data-key="' + escapeHtml(entry.key) + '">Revoke</button></td>' +
+            '</tr>';
+        })
+        .join('');
+    }
+
+    document.getElementById('add').addEventListener('click', () => {
+      vscode.postMessage({ type: 'add' });
+    });
+
+    document.getElementById('refresh').addEventListener('click', () => {
+      vscode.postMessage({ type: 'refresh' });
+    });
+
+    document.getElementById('clear').addEventListener('click', () => {
+      vscode.postMessage({ type: 'clear' });
+    });
+
+    filterEl.addEventListener('input', applyFilter);
+
+    rowsEl.addEventListener('click', (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) {
+        return;
+      }
+
+      if (!target.classList.contains('rowAction')) {
+        return;
+      }
+
+      const key = target.dataset.key || '';
+      if (!key) {
+        return;
+      }
+
+      vscode.postMessage({ type: 'revoke', key });
+    });
+
+    window.addEventListener('message', (event) => {
+      const message = event.data || {};
+      if (message.type !== 'permissionsState') {
+        return;
+      }
+
+      entries = Array.isArray(message.entries) ? message.entries : [];
+      totalEl.textContent = String(message.total || entries.length);
+      toastEl.textContent = message.toast || '';
+      applyFilter();
+    });
+
+    vscode.postMessage({ type: 'ready' });
+  </script>
+</body>
+</html>
+`;
 }
 
 function getSettingsWebviewHtml(): string {

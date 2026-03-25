@@ -10,6 +10,7 @@ test('buildQuickActionItems includes key commands', () => {
   assert.ok(commands.includes('devpilot.openChat'));
   assert.ok(commands.includes('devpilot.configureLlm'));
   assert.ok(commands.includes('devpilot.searchSubagent'));
+  assert.ok(commands.includes('devpilot.reconAndPlan'));
   assert.ok(commands.includes('devpilot.analyzeCurrentFile'));
   assert.ok(commands.includes('devpilot.explainSelection'));
   assert.ok(commands.includes('devpilot.generateTests'));

@@ -2,6 +2,8 @@ import * as vscode from 'vscode';
 
 export type DevpilotChatMode = 'chat' | 'agent' | 'plan';
 export type ToolApprovalScope = 'askEveryTime' | 'allowSession' | 'allowWorkspace';
+export type InlineDiagnosticFixMode = 'errorOnly' | 'errorAndWarning' | 'always';
+export type InlineContextMode = 'window' | 'fullFileWhenSmall';
 
 export interface ToolApprovalConfig {
   defaultReadScope: ToolApprovalScope;
@@ -16,6 +18,10 @@ export interface ARIAConfig {
   provider: string;
   model: string;
   inlineFastModelOverride: string;
+  inlineDebounceMs: number;
+  inlineLlmBudgetMs: number;
+  inlineCacheTtlMs: number;
+  inlineCacheMaxEntries: number;
   enabledTools: string[];
   chatMode: DevpilotChatMode;
   autoAttachCurrentFile: boolean;
@@ -29,6 +35,13 @@ export interface ARIAConfig {
   requestTimeoutMs: number;
   enableGuardrails: boolean;
   inlineLlmEnabled: boolean;
+  inlineDiagnosticFixMode: InlineDiagnosticFixMode;
+  inlineContextMode: InlineContextMode;
+  inlineMaxFileChars: number;
+  inlineIncludeImportedFiles: boolean;
+  inlineImportedFilesLimit: number;
+  quickFixEnabled: boolean;
+  agentToolWorkspaceAllowed: string[];
   toolApproval: ToolApprovalConfig;
   toolAuditMaxEntries: number;
 }
@@ -51,12 +64,32 @@ function normalizeChatMode(value: string): DevpilotChatMode {
   return 'chat';
 }
 
+function normalizeInlineDiagnosticFixMode(value: string): InlineDiagnosticFixMode {
+  if (value === 'errorOnly' || value === 'errorAndWarning' || value === 'always') {
+    return value;
+  }
+
+  return 'always';
+}
+
+function normalizeInlineContextMode(value: string): InlineContextMode {
+  if (value === 'window' || value === 'fullFileWhenSmall') {
+    return value;
+  }
+
+  return 'fullFileWhenSmall';
+}
+
 export function getDevpilotConfig(): ARIAConfig {
   const cfg = vscode.workspace.getConfiguration('devpilot');
 
   const provider = cfg.get<string>('provider', 'local').trim().toLowerCase() || 'local';
   const model = cfg.get<string>('model', 'aria-local-backend-v1').trim() || 'aria-local-backend-v1';
   const inlineFastModelOverride = cfg.get<string>('inlineFastModelOverride', '').trim();
+  const inlineDebounceMs = normalizeBoundedInt(cfg.get<number>('inlineDebounceMs', 90), 20, 500, 90);
+  const inlineLlmBudgetMs = normalizeBoundedInt(cfg.get<number>('inlineLlmBudgetMs', 1200), 300, 5000, 1200);
+  const inlineCacheTtlMs = normalizeBoundedInt(cfg.get<number>('inlineCacheTtlMs', 15000), 1000, 120000, 15000);
+  const inlineCacheMaxEntries = normalizeBoundedInt(cfg.get<number>('inlineCacheMaxEntries', 200), 20, 1000, 200);
   const enabledTools = cfg.get<string[]>(
     'enabledTools',
     ['create_directory', 'create_file', 'edit_file', 'write_file', 'replace_in_file', 'rename_file', 'search_workspace']
@@ -76,6 +109,15 @@ export function getDevpilotConfig(): ARIAConfig {
     : DEFAULT_TIMEOUT_MS;
   const enableGuardrails = cfg.get<boolean>('enableGuardrails', true);
   const inlineLlmEnabled = cfg.get<boolean>('inlineLlmEnabled', true);
+  const quickFixEnabled = cfg.get<boolean>('quickFixEnabled', false);
+  const inlineContextMode = normalizeInlineContextMode(cfg.get<string>('inlineContextMode', 'fullFileWhenSmall').trim());
+  const inlineMaxFileChars = normalizeBoundedInt(cfg.get<number>('inlineMaxFileChars', 18000), 4000, 120000, 18000);
+  const inlineIncludeImportedFiles = cfg.get<boolean>('inlineIncludeImportedFiles', true);
+  const inlineImportedFilesLimit = normalizeBoundedInt(cfg.get<number>('inlineImportedFilesLimit', 2), 0, 6, 2);
+  const inlineDiagnosticFixMode = normalizeInlineDiagnosticFixMode(
+    cfg.get<string>('inlineDiagnosticFixMode', 'always').trim()
+  );
+  const agentToolWorkspaceAllowed = cfg.get<string[]>('agentToolWorkspaceAllowed', []);
   const defaultReadScope = normalizeToolApprovalScope(cfg.get<string>('toolApproval.defaultReadScope', 'allowSession'));
   const defaultWriteScope = normalizeToolApprovalScope(cfg.get<string>('toolApproval.defaultWriteScope', 'askEveryTime'));
   const defaultExecuteScope = normalizeToolApprovalScope(cfg.get<string>('toolApproval.defaultExecuteScope', 'askEveryTime'));
@@ -91,6 +133,10 @@ export function getDevpilotConfig(): ARIAConfig {
     provider,
     model,
     inlineFastModelOverride,
+    inlineDebounceMs,
+    inlineLlmBudgetMs,
+    inlineCacheTtlMs,
+    inlineCacheMaxEntries,
     enabledTools,
     chatMode,
     autoAttachCurrentFile,
@@ -104,6 +150,13 @@ export function getDevpilotConfig(): ARIAConfig {
     requestTimeoutMs,
     enableGuardrails,
     inlineLlmEnabled,
+    inlineDiagnosticFixMode,
+    inlineContextMode,
+    inlineMaxFileChars,
+    inlineIncludeImportedFiles,
+    inlineImportedFilesLimit,
+    quickFixEnabled,
+    agentToolWorkspaceAllowed,
     toolApproval: {
       defaultReadScope,
       defaultWriteScope,
@@ -114,6 +167,15 @@ export function getDevpilotConfig(): ARIAConfig {
     },
     toolAuditMaxEntries
   };
+}
+
+function normalizeBoundedInt(value: number, min: number, max: number, fallback: number): number {
+  if (!Number.isFinite(value)) {
+    return fallback;
+  }
+
+  const normalized = Math.trunc(value);
+  return Math.min(max, Math.max(min, normalized));
 }
 
 export function resolveChatEndpoint(config: ARIAConfig, localBackendBaseUrl: string): string {

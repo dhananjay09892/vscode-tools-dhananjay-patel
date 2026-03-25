@@ -15,6 +15,9 @@ Devpilot is a VS Code extension prototype for repository-aware development assis
 	- `Devpilot: Generate Tests`
 	- `Devpilot: Refactor Suggestion`
 - Quick command hub: `Devpilot: Quick Actions`
+- Multi-agent collaboration command: `Devpilot: Agent Swarm` (run multiple specialist roles, choose 1-3 rounds, and synthesize one plan)
+- Optional per-agent tool execution approvals in Agent Swarm (allow once, allow for agent session, allow for agent workspace)
+- Agent permission management panel: `Devpilot: Manage Agent Permissions` (search/filter, add, clear, and one-click revoke)
 - Inline ghost text provider with debounce/cancellation
 - Settings, guardrails, secrets integration, structured logging
 
