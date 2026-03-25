@@ -266,31 +266,3 @@ Install it in VS Code:
 
 The extension stores keys in VS Code SecretStorage.
 Use `Devpilot: Configure LLM` as the single setup path for provider auth and model selection.
-
-### Local Development
-
-```powershell
-npm --prefix tools/devpilot-tool install
-npm --prefix tools/devpilot-tool run compile
-```
-
-Open `tools/devpilot-tool` in VS Code and press `F5` to launch Extension Development Host.
-
-### Tests
-
-```powershell
-npm --prefix tools/devpilot-tool run test
-```
-
-### Package VSIX
-
-```powershell
-npm --prefix tools/devpilot-tool run package:vsix
-```
-
-### Rollout Docs
-
-- Internal setup guide: `docs/internal-setup-guide.md`
-- Pilot feedback template: `docs/pilot-feedback-template.md`
-- Release notes: `CHANGELOG.md`
-
